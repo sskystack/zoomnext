@@ -41,6 +41,10 @@ See [Google Drive](https://drive.google.com/drive/folders/1Hp3GIqossOrJYs3bRzJIC
 
 ## Prepare Data
 
+> [!note]
+>
+> CAD dataset can be found at https://drive.google.com/file/d/1XhrC6NSekGOAAM7osLne3p46pj1tLFdI/view?usp=sharing
+>
 > Based on the following data setup, the performance of the VCOD dataset evaluated directly using the training script is now consistent with the paper.
 
 Set all dataset information to the `dataset.yaml` as follows.
