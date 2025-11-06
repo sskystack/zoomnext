@@ -43,7 +43,8 @@ See [Google Drive](https://drive.google.com/drive/folders/1Hp3GIqossOrJYs3bRzJIC
 
 > [!note]
 >
-> CAD dataset can be found at https://drive.google.com/file/d/1XhrC6NSekGOAAM7osLne3p46pj1tLFdI/view?usp=sharing
+> - CAD dataset can be found at https://drive.google.com/file/d/1XhrC6NSekGOAAM7osLne3p46pj1tLFdI/view?usp=sharing
+> - COD dataset for testing can be found at https://github.com/GewelsJI/SINet-V2?tab=readme-ov-file#41-trainingtesting (https://drive.google.com/file/d/1V0iSEdYJrT0Y_DHZfVGMg6TySFRNTy4o/view?usp=sharing)
 >
 > Based on the following data setup, the performance of the VCOD dataset evaluated directly using the training script is now consistent with the paper.
 
