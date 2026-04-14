@@ -5896,6 +5896,134 @@ progress = tqdm(total=total_iters, desc="[JT-TRAIN]", ncols=100, mininterval=0.0
 - 当前慢在数据准备、前向还是反向
 - 是否已经完成参数更新与 checkpoint 保存
 
+## 15. 第九轮更新：补齐训练日志保存机制
+
+在训练入口已经能跑 step、能显示进度条之后，这一轮继续补齐“落盘日志”能力。
+
+目标是让 Jittor 训练脚本不只是在终端里打印，而是像真正可追溯的实验入口一样，把运行信息保存到输出目录中。
+
+### 15.1 本轮修改的文件
+
+- `scripts/train_jittor_rn50_zoomnext.py`
+
+### 15.2 本轮核心改动
+
+训练脚本新增了以下日志与实验产物保存机制：
+
+1. 自动创建实验目录  
+   复用 `utils/py_utils.py` 中的：
+   - `construct_exp_name`
+   - `construct_path`
+   - `pre_mkdir`
+
+2. 自动保存配置与脚本副本  
+   每次运行都会保存：
+   - 当前 config 副本
+   - 当前训练脚本副本
+
+3. 保存运行元信息  
+   新增 `run_meta.json`，记录：
+   - config 路径
+   - data config 路径
+   - output 目录
+   - 是否 pretrained
+   - encoder 权重路径
+   - resume 路径
+   - max iters
+   - save every
+   - seed
+   - use cuda
+
+4. 保存逐 iter 结构化日志  
+   新增：
+   - `train_iter.jsonl`
+
+5. 保存 checkpoint 元信息  
+   新增：
+   - `checkpoint_log.jsonl`
+
+6. 保存文本训练日志  
+   新增：
+   - `log_日期.txt`
+
+### 15.3 关键代码片段
+
+#### 运行目录准备
+
+```python
+def prepare_run_dirs(args: argparse.Namespace, cfg) -> dict[str, Path]:
+    exp_name = py_utils.construct_exp_name(model_name="RN50_ZoomNeXt_JT", cfg=cfg)
+    path_cfg = py_utils.construct_path(output_dir=args.output_dir, exp_name=exp_name)
+    py_utils.pre_mkdir(path_cfg)
+
+    run_dir = Path(path_cfg["pth_log"])
+    checkpoints_dir = Path(path_cfg["pth"])
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    config_copy_path = Path(path_cfg["cfg_copy"])
+    trainer_copy_path = Path(path_cfg["trainer_copy"])
+    log_path = Path(path_cfg["log"])
+    iter_log_path = run_dir / "train_iter.jsonl"
+    ckpt_log_path = run_dir / "checkpoint_log.jsonl"
+    run_meta_path = run_dir / "run_meta.json"
+```
+
+这部分的作用是把当前 Jittor 训练入口也纳入和原仓库相近的实验目录组织方式里，而不是只把 checkpoint 零散地丢到一个目录里。
+
+#### 逐 iter 日志保存
+
+```python
+append_jsonl(run_paths["iter_log"], item)
+append_text_log(run_paths["log"], json.dumps(item, ensure_ascii=False))
+```
+
+这意味着每个 iter 的：
+
+- `iter`
+- `epoch`
+- `lr`
+- `loss`
+- `loss_str`
+- `shape`
+
+都会同时进入：
+
+- 结构化 `jsonl`
+- 文本 `log`
+
+#### checkpoint 保存日志
+
+```python
+ckpt_item = {"checkpoint": str(save_path), "iter": curr_iter, "epoch": epoch}
+progress.write(json.dumps(ckpt_item, ensure_ascii=False))
+append_jsonl(run_paths["ckpt_log"], ckpt_item)
+append_text_log(run_paths["log"], json.dumps(ckpt_item, ensure_ascii=False))
+```
+
+这让后续查看训练结果时，不需要靠猜测 checkpoint 是在哪一轮保存的。
+
+### 15.4 现在训练脚本会保存什么
+
+一次 Jittor 训练运行结束后，输出目录下至少会出现这些内容：
+
+- 实验目录
+- config 副本
+- trainer 副本
+- 文本日志
+- `run_meta.json`
+- `train_iter.jsonl`
+- `checkpoint_log.jsonl`
+- checkpoint 权重文件
+
+### 15.5 这轮修改后的意义
+
+到这一步，`train_jittor_rn50_zoomnext.py` 已经不只是“能跑两步”的脚本，而是具备了基础实验管理能力：
+
+- 能追溯本次运行参数
+- 能回看每步 loss
+- 能定位 checkpoint 保存时机
+- 能保留训练脚本与配置快照
+
 ### 14.17 最小训练中的 `doesn't have gradient` 警告说明
 
 用户继续观察到如下警告：

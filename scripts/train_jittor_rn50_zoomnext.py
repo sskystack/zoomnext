@@ -7,8 +7,10 @@ import argparse
 import json
 import os
 import random
+import shutil
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import albumentations as A
@@ -24,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from jittor_impl.models import RN50_ZoomNeXt_JT
 from jittor_impl.models.zoomnext_jt import frozen_bn_stats_jt
-from utils import io, ops
+from utils import io, ops, py_utils
 
 
 def emit_progress(progress, *, epoch: int, curr_iter: int, stage: str, extra: str = "") -> None:
@@ -34,6 +36,65 @@ def emit_progress(progress, *, epoch: int, curr_iter: int, stage: str, extra: st
         suffix = f"{suffix} {extra}"
     progress.set_postfix_str(suffix)
     progress.refresh()
+
+
+def append_jsonl(path: Path, payload: dict) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def append_text_log(path: Path, text: str) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(text + "\n")
+
+
+def prepare_run_dirs(args: argparse.Namespace, cfg) -> dict[str, Path]:
+    exp_name = py_utils.construct_exp_name(model_name="RN50_ZoomNeXt_JT", cfg=cfg)
+    path_cfg = py_utils.construct_path(output_dir=args.output_dir, exp_name=exp_name)
+    py_utils.pre_mkdir(path_cfg)
+
+    run_dir = Path(path_cfg["pth_log"])
+    checkpoints_dir = Path(path_cfg["pth"])
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    config_copy_path = Path(path_cfg["cfg_copy"])
+    trainer_copy_path = Path(path_cfg["trainer_copy"])
+    log_path = Path(path_cfg["log"])
+    iter_log_path = run_dir / "train_iter.jsonl"
+    ckpt_log_path = run_dir / "checkpoint_log.jsonl"
+    run_meta_path = run_dir / "run_meta.json"
+
+    shutil.copy2(args.config, config_copy_path)
+    shutil.copy2(Path(__file__).resolve(), trainer_copy_path)
+
+    run_meta = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "config": str(Path(args.config).resolve()),
+        "data_cfg": str(Path(args.data_cfg).resolve()),
+        "output_dir": str(Path(args.output_dir).resolve()),
+        "train_datasets": list(args.train_datasets) if args.train_datasets else None,
+        "pretrained": args.pretrained,
+        "encoder_weight_path": args.encoder_weight_path,
+        "resume_from": args.resume_from,
+        "max_iters": args.max_iters,
+        "save_every": args.save_every,
+        "seed": args.seed,
+        "use_cuda": args.use_cuda,
+    }
+    run_meta_path.write_text(json.dumps(run_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    append_text_log(log_path, f"=== Jittor training run {run_meta['created_at']} ===")
+    append_text_log(log_path, json.dumps(run_meta, ensure_ascii=False))
+
+    return {
+        "run_dir": run_dir,
+        "checkpoints_dir": checkpoints_dir,
+        "config_copy": config_copy_path,
+        "trainer_copy": trainer_copy_path,
+        "log": log_path,
+        "iter_log": iter_log_path,
+        "ckpt_log": ckpt_log_path,
+        "run_meta": run_meta_path,
+    }
 
 
 class ImageTrainDatasetJT:
@@ -238,6 +299,7 @@ def main() -> int:
     import jittor as jt
 
     jt.flags.use_cuda = 1 if args.use_cuda else 0
+    run_paths = prepare_run_dirs(args, cfg)
 
     train_names = args.train_datasets or list(cfg.train.data.names)
     dataset = ImageTrainDatasetJT(
@@ -271,9 +333,7 @@ def main() -> int:
         optim_cfg=cfg.train.optimizer.cfg,
     )
 
-    output_dir = Path(args.output_dir)
-    checkpoint_dir = output_dir / "checkpoints"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = run_paths["checkpoints_dir"]
 
     batch_size = int(cfg.train.batch_size)
     num_epochs = int(cfg.train.num_epochs)
@@ -317,12 +377,17 @@ def main() -> int:
                 extra=f"loss={item['loss']:.5f} lr={item['lr_string']}",
             )
             progress.write(json.dumps(item, ensure_ascii=False))
+            append_jsonl(run_paths["iter_log"], item)
+            append_text_log(run_paths["log"], json.dumps(item, ensure_ascii=False))
 
             curr_iter += 1
             if curr_iter % args.save_every == 0 or curr_iter == total_iters:
                 emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="save")
                 save_path = save_checkpoint(jt, model, checkpoint_dir, curr_iter)
-                progress.write(json.dumps({"checkpoint": str(save_path)}, ensure_ascii=False))
+                ckpt_item = {"checkpoint": str(save_path), "iter": curr_iter, "epoch": epoch}
+                progress.write(json.dumps(ckpt_item, ensure_ascii=False))
+                append_jsonl(run_paths["ckpt_log"], ckpt_item)
+                append_text_log(run_paths["log"], json.dumps(ckpt_item, ensure_ascii=False))
 
             if curr_iter >= total_iters:
                 break
@@ -332,7 +397,10 @@ def main() -> int:
     progress.close()
     final_path = save_checkpoint(jt, model, checkpoint_dir, curr_iter)
     elapsed = time.perf_counter() - start_time
-    print(json.dumps({"final_checkpoint": str(final_path), "elapsed_sec": elapsed}, ensure_ascii=False))
+    final_item = {"final_checkpoint": str(final_path), "elapsed_sec": elapsed, "iters": curr_iter}
+    print(json.dumps(final_item, ensure_ascii=False))
+    append_jsonl(run_paths["ckpt_log"], final_item)
+    append_text_log(run_paths["log"], json.dumps(final_item, ensure_ascii=False))
     return 0
 
 
