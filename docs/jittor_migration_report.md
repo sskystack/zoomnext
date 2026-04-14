@@ -2249,3 +2249,77 @@ python3 scripts/validate_jittor_mhsiu.py
 ```
 
 如果这次误差显著下降，就说明我们已经抓到了 `MHSIU` 的主要误差源。
+
+### 9.19 修复后的最终 `MHSIU` 验证结果
+
+你重新执行了：
+
+```bash
+python3 scripts/validate_jittor_mhsiu.py
+```
+
+本次输出结果为：
+
+```json
+{
+  "name": "MHSIU",
+  "shape": [2, 16, 11, 13],
+  "max_abs_err": 1.4901161193847656e-07,
+  "mean_abs_err": 1.4817379323517343e-08
+}
+```
+
+最终结论：
+
+```text
+Validation passed.
+```
+
+### 9.20 这次结果说明什么
+
+这次结果说明：
+
+1. `MHSIU` 的主要误差源已经被正确定位为自适应池化语义差异
+2. 用 PyTorch 兼容公式重写自适应池化后，Jittor 版 `MHSIU` 已与原 PyTorch 实现数值对齐
+3. 当前 `MHSIU` 已达到模块级等价迁移要求
+
+从误差量级看：
+
+- `max_abs_err = 1.49e-07`
+- `mean_abs_err = 1.48e-08`
+
+这同样远小于模块验证阈值：
+
+- `tol-max = 1e-5`
+- `tol-mean = 1e-6`
+
+因此现在可以明确得出结论：
+
+> `MHSIU` 已完成等价迁移，并通过了 Ubuntu 容器中的 PyTorch/Jittor 模块级对照验证。
+
+### 9.21 当前阶段状态更新
+
+截至当前，已经完成并验证通过的部分有：
+
+- 基础算子层
+  - `resize_to`
+  - `rescale_2x`
+  - `PixelNormalizer`
+  - `LayerNorm2d`
+  - `adaptive_avg_pool2d_pt`
+  - `adaptive_max_pool2d_pt`
+- 核心层
+  - `SimpleASPP`
+  - `MHSIU`
+
+仍未完成的模块：
+
+- `DifferenceAwareOps`
+- `RGPU`
+- `ResNet50 backbone`
+- `RN50_ZoomNeXt` 整体前向
+
+下一步建议：
+
+优先迁移 `DifferenceAwareOps`。  
+原因是它是 `RGPU` 的内部依赖，先把时序差分模块独立迁完并验证，后面 `RGPU` 的迁移风险会小很多。
