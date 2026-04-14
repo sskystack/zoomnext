@@ -72,7 +72,10 @@ def prepare_run_dirs(args: argparse.Namespace, cfg) -> dict[str, Path]:
         "config": str(Path(args.config).resolve()),
         "data_cfg": str(Path(args.data_cfg).resolve()),
         "output_dir": str(Path(args.output_dir).resolve()),
-        "train_datasets": list(args.train_datasets) if args.train_datasets else None,
+        "train_datasets": list(cfg.train.data.names),
+        "effective_batch_size": int(cfg.train.batch_size),
+        "effective_num_epochs": int(cfg.train.num_epochs),
+        "effective_lr": float(cfg.train.lr),
         "pretrained": args.pretrained,
         "encoder_weight_path": args.encoder_weight_path,
         "resume_from": args.resume_from,
@@ -169,6 +172,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-cfg", required=True, type=str)
     parser.add_argument("--output-dir", type=str, default="outputs_jittor")
     parser.add_argument("--train-datasets", nargs="+", type=str)
+    parser.add_argument("--num-epochs", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--lr", type=float)
     parser.add_argument("--pretrained", action="store_true")
     parser.add_argument("--encoder-weight-path", type=str, default="pretrained_weights/resnet50-timm.pth")
     parser.add_argument("--resume-from", type=str)
@@ -195,6 +201,14 @@ def load_cfg(args: argparse.Namespace):
     )
     with open(args.data_cfg, mode="r", encoding="utf-8") as f:
         cfg.dataset_infos = yaml.safe_load(f)
+    if args.train_datasets:
+        cfg.train.data.names = list(args.train_datasets)
+    if args.num_epochs is not None:
+        cfg.train.num_epochs = int(args.num_epochs)
+    if args.batch_size is not None:
+        cfg.train.batch_size = int(args.batch_size)
+    if args.lr is not None:
+        cfg.train.lr = float(args.lr)
     return cfg
 
 
@@ -301,7 +315,7 @@ def main() -> int:
     jt.flags.use_cuda = 1 if args.use_cuda else 0
     run_paths = prepare_run_dirs(args, cfg)
 
-    train_names = args.train_datasets or list(cfg.train.data.names)
+    train_names = list(cfg.train.data.names)
     dataset = ImageTrainDatasetJT(
         dataset_infos={data_name: cfg.dataset_infos[data_name] for data_name in train_names},
         shape=cfg.train.data.shape,

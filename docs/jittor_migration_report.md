@@ -6163,3 +6163,181 @@ num_frames = 1
 
 1. 第 `1` 个 iter 是否也能正常完成
 2. 是否能打印 checkpoint 保存信息并正常退出
+
+## 16. 训练入口补充命令行覆盖参数
+
+这一轮继续完善 `scripts/train_jittor_rn50_zoomnext.py`，目标是让正式训练时不必为了改动常用超参数而手动编辑配置文件。
+
+新增的命令行覆盖项包括：
+
+- `--num-epochs`
+- `--batch-size`
+- `--lr`
+- `--train-datasets`
+
+这里特别说明一下：`--train-datasets` 之前已经有参数入口，但这一轮把它纳入了统一的配置覆盖逻辑，并且写入了最终运行元信息，避免“命令行传了，但元信息里看不出来最终生效值”的问题。
+
+### 16.1 修改后的关键代码
+
+本轮修改的完整代码片段如下。
+
+```python
+def prepare_run_dirs(args: argparse.Namespace, cfg) -> dict[str, Path]:
+    exp_name = py_utils.construct_exp_name(model_name="RN50_ZoomNeXt_JT", cfg=cfg)
+    path_cfg = py_utils.construct_path(output_dir=args.output_dir, exp_name=exp_name)
+    py_utils.pre_mkdir(path_cfg)
+
+    run_dir = Path(path_cfg["pth_log"])
+    checkpoints_dir = Path(path_cfg["pth"])
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    config_copy_path = Path(path_cfg["cfg_copy"])
+    trainer_copy_path = Path(path_cfg["trainer_copy"])
+    log_path = Path(path_cfg["log"])
+    iter_log_path = run_dir / "train_iter.jsonl"
+    ckpt_log_path = run_dir / "checkpoint_log.jsonl"
+    run_meta_path = run_dir / "run_meta.json"
+
+    shutil.copy2(args.config, config_copy_path)
+    shutil.copy2(Path(__file__).resolve(), trainer_copy_path)
+
+    run_meta = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "config": str(Path(args.config).resolve()),
+        "data_cfg": str(Path(args.data_cfg).resolve()),
+        "output_dir": str(Path(args.output_dir).resolve()),
+        "train_datasets": list(cfg.train.data.names),
+        "effective_batch_size": int(cfg.train.batch_size),
+        "effective_num_epochs": int(cfg.train.num_epochs),
+        "effective_lr": float(cfg.train.lr),
+        "pretrained": args.pretrained,
+        "encoder_weight_path": args.encoder_weight_path,
+        "resume_from": args.resume_from,
+        "max_iters": args.max_iters,
+        "save_every": args.save_every,
+        "seed": args.seed,
+        "use_cuda": args.use_cuda,
+    }
+    run_meta_path.write_text(json.dumps(run_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    append_text_log(log_path, f"=== Jittor training run {run_meta['created_at']} ===")
+    append_text_log(log_path, json.dumps(run_meta, ensure_ascii=False))
+
+    return {
+        "run_dir": run_dir,
+        "checkpoints_dir": checkpoints_dir,
+        "config_copy": config_copy_path,
+        "trainer_copy": trainer_copy_path,
+        "log": log_path,
+        "iter_log": iter_log_path,
+        "ckpt_log": ckpt_log_path,
+        "run_meta": run_meta_path,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser("Jittor RN50_ZoomNeXt training script")
+    parser.add_argument("--config", required=True, type=str)
+    parser.add_argument("--data-cfg", required=True, type=str)
+    parser.add_argument("--output-dir", type=str, default="outputs_jittor")
+    parser.add_argument("--train-datasets", nargs="+", type=str)
+    parser.add_argument("--num-epochs", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--pretrained", action="store_true")
+    parser.add_argument("--encoder-weight-path", type=str, default="pretrained_weights/resnet50-timm.pth")
+    parser.add_argument("--resume-from", type=str)
+    parser.add_argument("--max-iters", type=int)
+    parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=112358)
+    parser.add_argument("--use-cuda", action="store_true")
+    return parser.parse_args()
+
+
+def load_cfg(args: argparse.Namespace):
+    cfg = Config.fromfile(args.config)
+    cfg.merge_from_dict(
+        {
+            "data_cfg": args.data_cfg,
+            "output_dir": args.output_dir,
+            "pretrained": args.pretrained,
+        }
+    )
+    with open(args.data_cfg, mode="r", encoding="utf-8") as f:
+        cfg.dataset_infos = yaml.safe_load(f)
+    if args.train_datasets:
+        cfg.train.data.names = list(args.train_datasets)
+    if args.num_epochs is not None:
+        cfg.train.num_epochs = int(args.num_epochs)
+    if args.batch_size is not None:
+        cfg.train.batch_size = int(args.batch_size)
+    if args.lr is not None:
+        cfg.train.lr = float(args.lr)
+    return cfg
+
+
+def main() -> int:
+    args = parse_args()
+    set_seed(args.seed)
+    cfg = load_cfg(args)
+
+    import jittor as jt
+
+    jt.flags.use_cuda = 1 if args.use_cuda else 0
+    run_paths = prepare_run_dirs(args, cfg)
+
+    train_names = list(cfg.train.data.names)
+    dataset = ImageTrainDatasetJT(
+        dataset_infos={data_name: cfg.dataset_infos[data_name] for data_name in train_names},
+        shape=cfg.train.data.shape,
+    )
+```
+
+### 16.2 这段代码在做什么
+
+这次修改主要做了三件事。
+
+第一件事，是给训练入口补齐常用超参数覆盖项：
+
+- `--num-epochs` 用来覆盖 `cfg.train.num_epochs`
+- `--batch-size` 用来覆盖 `cfg.train.batch_size`
+- `--lr` 用来覆盖 `cfg.train.lr`
+- `--train-datasets` 用来覆盖 `cfg.train.data.names`
+
+这样后续在 Ubuntu 容器里正式训练时，只需要改命令行，不需要反复改 `configs/icod_train.py`。
+
+第二件事，是统一覆盖顺序。  
+当前逻辑变成了：
+
+1. 先读取原始 config
+2. 再加载本地 `dataset.yaml`
+3. 最后用命令行参数覆盖训练配置
+
+这保证“命令行优先级高于配置文件”，符合常见训练脚本的使用习惯。
+
+第三件事，是把“最终真正生效的配置值”写进 `run_meta.json`：
+
+- `train_datasets`
+- `effective_batch_size`
+- `effective_num_epochs`
+- `effective_lr`
+
+这样后面回看实验目录时，可以直接知道这次训练到底用了什么配置，而不是只看到原始 config 文件路径。
+
+### 16.3 为什么这一轮修改是必要的
+
+在前面几轮里，我们已经完成了：
+
+- 模型结构等价迁移
+- 前向验证
+- 训练 smoke test
+- 日志与 checkpoint 基础落盘
+
+接下来进入正式训练阶段时，最常见的操作就是：
+
+- 临时缩短 epoch 做试跑
+- 调整 batch size 适配显存
+- 修改学习率
+- 切换训练数据集
+
+如果这些仍然必须靠手改配置文件，会让实验管理变得很不方便，也容易忘记恢复原配置。  
+因此这一步虽然不改模型数值逻辑，但对正式训练启动是必要的工程化补齐。
