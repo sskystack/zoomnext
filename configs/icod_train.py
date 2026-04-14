@@ -48,7 +48,7 @@ train = dict(
     ),
     data=dict(
         shape=dict(h=384, w=384),
-        names=["cod10k_tr", "camo_tr"],
+        names=["cod10k_tr"],
     ),
 )
 
