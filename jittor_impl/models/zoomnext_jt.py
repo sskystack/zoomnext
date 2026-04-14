@@ -35,6 +35,21 @@ def _scalar(var: jt.Var) -> float:
     return float(var.numpy().reshape(-1)[0])
 
 
+def frozen_bn_stats_jt(model: nn.Module, freeze_affine: bool = False) -> None:
+    for module in model.modules():
+        if isinstance(module, nn.BatchNorm2d):
+            module.eval()
+            if freeze_affine:
+                if hasattr(module, "weight") and module.weight is not None:
+                    module.weight.requires_grad = False
+                if hasattr(module, "bias") and module.bias is not None:
+                    module.bias.requires_grad = False
+
+
+def _is_buffer_like_parameter(name: str) -> bool:
+    return name.endswith("running_mean") or name.endswith("running_var") or name.endswith("num_batches_tracked")
+
+
 class _ZoomNeXt_Base(nn.Module):
     @staticmethod
     def get_coef(iter_percentage=1, method="cos", milestones=(0, 1)):
@@ -85,6 +100,8 @@ class _ZoomNeXt_Base(nn.Module):
     def get_grouped_params(self):
         param_groups = {"pretrained": [], "fixed": [], "retrained": []}
         for name, param in self.named_parameters():
+            if _is_buffer_like_parameter(name):
+                continue
             if name.startswith("encoder.patch_embed1."):
                 param.requires_grad = False
                 param_groups["fixed"].append(param)

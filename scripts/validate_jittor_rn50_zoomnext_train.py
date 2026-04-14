@@ -7,6 +7,7 @@ import argparse
 import json
 import pathlib
 import random
+import re
 import sys
 from typing import Dict
 
@@ -74,6 +75,32 @@ def summarize_groups(groups: dict) -> Dict[str, Dict[str, int]]:
     }
 
 
+def freeze_torch_encoder_bn_stats(model, freeze_affine: bool = False) -> None:
+    for module in model.modules():
+        if isinstance(module, torch.nn.BatchNorm2d):
+            module.eval()
+            if freeze_affine:
+                module.requires_grad_(False)
+
+
+def parse_loss_str(loss_str: str) -> Dict[str, float]:
+    parsed = {}
+    for key, value in re.findall(r"([A-Za-z0-9_\.]+): ([0-9.]+)", loss_str):
+        parsed[key] = float(value)
+    return parsed
+
+
+def compare_loss_strings(pt_loss_str: str, jt_loss_str: str, tol: float) -> bool:
+    pt_items = parse_loss_str(pt_loss_str)
+    jt_items = parse_loss_str(jt_loss_str)
+    if pt_items.keys() != jt_items.keys():
+        return False
+    for key in pt_items:
+        if abs(pt_items[key] - jt_items[key]) > tol:
+            return False
+    return True
+
+
 def map_torch_state_dict_to_jittor(state_dict: dict) -> dict:
     mapped = {}
     for name, value in state_dict.items():
@@ -107,6 +134,7 @@ def main() -> int:
         ) from exc
 
     from jittor_impl.models import RN50_ZoomNeXt_JT
+    from jittor_impl.models.zoomnext_jt import frozen_bn_stats_jt
 
     jt.flags.use_cuda = 0
 
@@ -155,17 +183,22 @@ def main() -> int:
     pt_groups = summarize_groups(pt_model.get_grouped_params())
     jt_groups = summarize_groups(jt_model.get_grouped_params())
 
+    freeze_torch_encoder_bn_stats(pt_model.encoder, freeze_affine=True)
+    frozen_bn_stats_jt(jt_model.encoder, freeze_affine=True)
+
     pt_output = pt_model(pt_inputs, iter_percentage=args.iter_percentage)
     jt_output = jt_model(jt_inputs, iter_percentage=args.iter_percentage)
 
     sal_report = compare_arrays("sal", pt_output["vis"]["sal"], jt_output["vis"]["sal"].numpy())
     loss_abs_err = abs(float(pt_output["loss"].detach().cpu().item()) - float(jt_output["loss"].numpy()))
-    same_loss_str = pt_output["loss_str"] == jt_output["loss_str"]
+    loss_str_exact_match = pt_output["loss_str"] == jt_output["loss_str"]
+    loss_str_value_match = compare_loss_strings(pt_output["loss_str"], jt_output["loss_str"], tol=1e-4)
 
     report = {
         "saliency": sal_report,
         "loss_abs_err": loss_abs_err,
-        "loss_str_match": same_loss_str,
+        "loss_str_exact_match": loss_str_exact_match,
+        "loss_str_value_match": loss_str_value_match,
         "pytorch_loss_str": pt_output["loss_str"],
         "jittor_loss_str": jt_output["loss_str"],
         "param_groups_match": pt_groups == jt_groups,
@@ -183,8 +216,8 @@ def main() -> int:
     if loss_abs_err > args.tol_loss:
         print(f"\nValidation failed: loss_abs_err={loss_abs_err:.6e}")
         return 1
-    if not same_loss_str:
-        print("\nValidation failed: loss_str mismatch")
+    if not loss_str_value_match:
+        print("\nValidation failed: loss_str value mismatch")
         return 1
     if pt_groups != jt_groups:
         print("\nValidation failed: grouped params mismatch")

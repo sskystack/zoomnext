@@ -17,6 +17,7 @@ import yaml
 from mmengine import Config
 
 from jittor_impl.models import RN50_ZoomNeXt_JT
+from jittor_impl.models.zoomnext_jt import frozen_bn_stats_jt
 from utils import io, ops
 
 
@@ -202,9 +203,9 @@ def maybe_freeze_encoder(model, freeze_encoder: bool):
         param.requires_grad = False
 
 
-def maybe_freeze_bn_stats(model, freeze_status: bool):
+def maybe_freeze_bn_stats(model, freeze_status: bool, freeze_affine: bool):
     if freeze_status:
-        model.encoder.eval()
+        frozen_bn_stats_jt(model.encoder, freeze_affine=freeze_affine)
 
 
 def save_checkpoint(jt, model, save_dir: Path, step: int):
@@ -267,7 +268,7 @@ def main() -> int:
     start_time = time.perf_counter()
     for epoch in range(num_epochs):
         model.train()
-        maybe_freeze_bn_stats(model, cfg.train.bn.freeze_status)
+        maybe_freeze_bn_stats(model, cfg.train.bn.freeze_status, cfg.train.bn.freeze_affine)
 
         for batch_ids in batch_indices(len(dataset), batch_size, seed=args.seed + epoch, drop_last=True):
             samples = [dataset[idx] for idx in batch_ids]

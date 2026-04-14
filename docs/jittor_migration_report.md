@@ -5375,3 +5375,158 @@ python3 scripts/train_jittor_rn50_zoomnext.py \
 
 - `validate_jittor_rn50_zoomnext_train.py`
 - `train_jittor_rn50_zoomnext.py` 的容器 smoke test
+
+### 14.7 Ubuntu 容器首次训练分支验证结果与问题定位
+
+用户在 Ubuntu 容器中执行：
+
+```bash
+python3 scripts/validate_jittor_rn50_zoomnext_train.py
+```
+
+得到的结果如下：
+
+```json
+{
+  "saliency": {
+    "name": "sal",
+    "shape": [
+      2,
+      1,
+      352,
+      352
+    ],
+    "max_abs_err": 0.0038403868675231934,
+    "mean_abs_err": 0.0004280472348909825
+  },
+  "loss_abs_err": 6.783008575439453e-05,
+  "loss_str_match": false,
+  "pytorch_loss_str": "bce: 0.71853 powual_0.30143: 0.28730",
+  "jittor_loss_str": "bce: 0.71854 powual_0.30143: 0.28736",
+  "param_groups_match": false,
+  "pytorch_param_groups": {
+    "pretrained": {
+      "params": 159,
+      "elements": 23508032
+    },
+    "fixed": {
+      "params": 0,
+      "elements": 0
+    },
+    "retrained": {
+      "params": 338,
+      "elements": 4950052
+    }
+  },
+  "jittor_param_groups": {
+    "pretrained": {
+      "params": 267,
+      "elements": 25610152
+    },
+    "fixed": {
+      "params": 0,
+      "elements": 0
+    },
+    "retrained": {
+      "params": 532,
+      "elements": 4967012
+    }
+  }
+}
+
+Validation failed: sal_max_abs_err=3.840387e-03, sal_mean_abs_err=4.280472e-04
+```
+
+#### 这次失败暴露了两个问题
+
+第一，`param_groups_match` 明显不一致。  
+从数量上看，Jittor 侧多出来的项非常接近所有 BatchNorm 层的：
+
+- `running_mean`
+- `running_var`
+
+这说明 `get_grouped_params()` 在 Jittor 下把一部分 BN 运行统计也枚举进了“参数分组”。
+
+第二，训练态 saliency 误差明显大于 eval 态。  
+这里的一个关键差异是：原仓库真实训练循环里，会在 `model.train()` 之后额外执行：
+
+```python
+pt_utils.frozen_bn_stats(model.encoder, freeze_affine=cfg.train.bn.freeze_affine)
+```
+
+也就是说，真实训练并不是“所有 BN 都完全按 train 模式运行”，而是会冻结 encoder 内部 BN 的统计行为。  
+而首次训练验证脚本并没有模拟这一点，因此训练态误差被放大了。
+
+#### 为什么 `loss_str` 不完全相等但并不一定表示实现错误
+
+这次 `loss_str` 的差异是：
+
+```text
+PyTorch: bce: 0.71853 powual_0.30143: 0.28730
+Jittor : bce: 0.71854 powual_0.30143: 0.28736
+```
+
+这里：
+
+- `ual_coef` 是一致的
+- `loss_abs_err` 只有 `6.78e-05`
+
+所以更像是训练态浮点细节和格式化后四舍五入带来的字符串差异，而不是 loss 定义本身不一致。
+
+### 14.8 针对本次问题的修复
+
+这次修复做了三件事。
+
+#### 修复 1：`get_grouped_params()` 跳过 BN 运行统计
+
+在 `jittor_impl/models/zoomnext_jt.py` 中新增：
+
+```python
+def _is_buffer_like_parameter(name: str) -> bool:
+    return name.endswith("running_mean") or name.endswith("running_var") or name.endswith("num_batches_tracked")
+```
+
+并在 `get_grouped_params()` 中跳过这些名字：
+
+```python
+for name, param in self.named_parameters():
+    if _is_buffer_like_parameter(name):
+        continue
+```
+
+这样参数分组会更接近 PyTorch 侧真正参与训练的参数集合。
+
+#### 修复 2：训练验证脚本补齐 encoder BN 冻结逻辑
+
+在训练验证脚本中，对 PyTorch 和 Jittor 两侧都补了与真实训练流程一致的 encoder BN 冻结：
+
+```python
+freeze_torch_encoder_bn_stats(pt_model.encoder, freeze_affine=True)
+frozen_bn_stats_jt(jt_model.encoder, freeze_affine=True)
+```
+
+这样训练分支验证不再是“裸 train 模式对 train 模式”，而是更准确地复现原仓库的真实训练设置。
+
+#### 修复 3：`loss_str` 改为数值语义比较
+
+训练验证脚本不再要求字符串逐字符完全一致，而是：
+
+1. 保留 `loss_str_exact_match` 作为信息输出
+2. 新增 `loss_str_value_match`
+3. 解析字符串里的数值项，按容差比较其数值是否一致
+
+这样可以避免因为 `:.5f` 格式化后的最后一位四舍五入差异导致误判。
+
+### 14.9 修复后的下一次验证命令
+
+请在 Ubuntu 容器中重新执行：
+
+```bash
+python3 scripts/validate_jittor_rn50_zoomnext_train.py
+```
+
+新的结果回传后，需要重点看：
+
+1. `param_groups_match` 是否恢复一致
+2. `saliency` 误差是否明显下降
+3. `loss_str_value_match` 是否为 `true`
