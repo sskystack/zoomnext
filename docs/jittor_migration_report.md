@@ -6711,3 +6711,336 @@ if __name__ == "__main__":
 - 评估指标能不能和原仓库流程保持一致
 
 因此，这一步完成后，Jittor 迁移就从“模块迁移 + 前向验证”进入了“训练/验证闭环打通”的阶段。
+
+## 18. 补齐正式评测命令与结果汇总脚本
+
+这一轮继续把“训练闭环”做成更好用的工程化入口，新增两部分内容：
+
+- 一个正式评测封装脚本，减少每次手敲长命令的成本
+- 一个结果汇总脚本，把 `eval_results.json` 转成终端表格或 Markdown 表格
+
+新增文件：
+
+- `scripts/run_jittor_rn50_zoomnext_eval.sh`
+- `scripts/summarize_jittor_eval_results.py`
+
+### 18.1 正式评测封装脚本完整代码
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+CONFIG="configs/icod_train.py"
+DATA_CFG="./dataset.yaml"
+OUTPUT_DIR="outputs_jittor_eval"
+BATCH_SIZE="4"
+ENCODER_WEIGHT_PATH="pretrained_weights/resnet50-timm.pth"
+USE_CUDA=1
+SAVE_RESULTS=1
+PRETRAINED=0
+CKPT=""
+TEST_DATASETS=("chameleon" "camo_te" "cod10k_te" "nc4k")
+
+usage() {
+  cat <<'EOF'
+用法:
+  bash scripts/run_jittor_rn50_zoomnext_eval.sh --ckpt <checkpoint.pkl> [可选参数]
+
+可选参数:
+  --config <path>                配置文件路径，默认 configs/icod_train.py
+  --data-cfg <path>              数据集配置路径，默认 ./dataset.yaml
+  --output-dir <path>            输出目录，默认 outputs_jittor_eval
+  --batch-size <int>             测试 batch size，默认 4
+  --encoder-weight-path <path>   ResNet50 预训练权重路径
+  --test-datasets <names...>     测试集列表，默认 chameleon camo_te cod10k_te nc4k
+  --cpu                          使用 CPU 推理
+  --no-save-results              不保存预测图，只计算指标
+  --pretrained                   初始化模型时加载 encoder 预训练权重
+  -h, --help                     显示帮助
+
+示例:
+  bash scripts/run_jittor_rn50_zoomnext_eval.sh \
+    --ckpt outputs_jittor/.../step_000002.pkl \
+    --batch-size 4 \
+    --test-datasets chameleon camo_te cod10k_te nc4k
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ckpt)
+      CKPT="$2"
+      shift 2
+      ;;
+    --config)
+      CONFIG="$2"
+      shift 2
+      ;;
+    --data-cfg)
+      DATA_CFG="$2"
+      shift 2
+      ;;
+    --output-dir)
+      OUTPUT_DIR="$2"
+      shift 2
+      ;;
+    --batch-size)
+      BATCH_SIZE="$2"
+      shift 2
+      ;;
+    --encoder-weight-path)
+      ENCODER_WEIGHT_PATH="$2"
+      shift 2
+      ;;
+    --test-datasets)
+      shift
+      TEST_DATASETS=()
+      while [[ $# -gt 0 && "${1}" != --* ]]; do
+        TEST_DATASETS+=("$1")
+        shift
+      done
+      ;;
+    --cpu)
+      USE_CUDA=0
+      shift
+      ;;
+    --no-save-results)
+      SAVE_RESULTS=0
+      shift
+      ;;
+    --pretrained)
+      PRETRAINED=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "未知参数: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "${CKPT}" ]]; then
+  echo "缺少 --ckpt 参数" >&2
+  usage
+  exit 1
+fi
+
+CMD=(
+  python3 scripts/test_jittor_rn50_zoomnext.py
+  --config "${CONFIG}"
+  --data-cfg "${DATA_CFG}"
+  --load-from "${CKPT}"
+  --output-dir "${OUTPUT_DIR}"
+  --batch-size "${BATCH_SIZE}"
+  --encoder-weight-path "${ENCODER_WEIGHT_PATH}"
+  --test-datasets "${TEST_DATASETS[@]}"
+)
+
+if [[ "${SAVE_RESULTS}" == "1" ]]; then
+  CMD+=(--save-results)
+fi
+
+if [[ "${PRETRAINED}" == "1" ]]; then
+  CMD+=(--pretrained)
+fi
+
+if [[ "${USE_CUDA}" == "1" ]]; then
+  CMD+=(--use-cuda)
+fi
+
+printf '执行命令:\n%s\n' "${CMD[*]}"
+"${CMD[@]}"
+```
+
+### 18.2 结果汇总脚本完整代码
+
+```python
+#!/usr/bin/env python3
+"""Summarize Jittor evaluation results into readable tables."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser("Summarize Jittor evaluation results")
+    parser.add_argument("--result-json", nargs="+", required=True, type=Path)
+    parser.add_argument("--format", choices=("text", "markdown", "json"), default="text")
+    parser.add_argument("--save", type=Path)
+    parser.add_argument("--metrics", nargs="+", type=str)
+    return parser.parse_args()
+
+
+def infer_metric_order(data: dict, preferred_metrics: list[str] | None) -> list[str]:
+    if preferred_metrics:
+        return preferred_metrics
+    metric_names = []
+    for dataset_metrics in data.values():
+        for key in dataset_metrics.keys():
+            if key not in metric_names:
+                metric_names.append(key)
+    return metric_names
+
+
+def compute_mean_row(data: dict, metric_names: list[str]) -> dict[str, float]:
+    mean_row = {}
+    num_rows = max(len(data), 1)
+    for metric_name in metric_names:
+        total = sum(float(dataset_metrics.get(metric_name, 0.0)) for dataset_metrics in data.values())
+        mean_row[metric_name] = total / num_rows
+    return mean_row
+
+
+def render_text_table(title: str, rows: list[dict], metric_names: list[str]) -> str:
+    headers = ["dataset", *metric_names]
+    table_rows = [[row["dataset"], *[f"{float(row.get(metric, 0.0)):.3f}" for metric in metric_names]] for row in rows]
+    widths = [len(header) for header in headers]
+    for table_row in table_rows:
+        for idx, cell in enumerate(table_row):
+            widths[idx] = max(widths[idx], len(cell))
+
+    def _render_line(values: list[str]) -> str:
+        return " | ".join(value.ljust(widths[idx]) for idx, value in enumerate(values))
+
+    parts = [title, _render_line(headers), "-+-".join("-" * width for width in widths)]
+    parts.extend(_render_line(row) for row in table_rows)
+    return "\n".join(parts)
+
+
+def render_markdown_table(title: str, rows: list[dict], metric_names: list[str]) -> str:
+    headers = ["dataset", *metric_names]
+    separator = ["---"] * len(headers)
+    lines = [f"### {title}", "| " + " | ".join(headers) + " |", "| " + " | ".join(separator) + " |"]
+    for row in rows:
+        values = [row["dataset"], *[f"{float(row.get(metric, 0.0)):.3f}" for metric in metric_names]]
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def build_summary(result_path: Path, preferred_metrics: list[str] | None) -> dict:
+    data = json.loads(result_path.read_text(encoding="utf-8"))
+    metric_names = infer_metric_order(data, preferred_metrics)
+    mean_row = compute_mean_row(data, metric_names)
+    rows = [{"dataset": dataset_name, **dataset_metrics} for dataset_name, dataset_metrics in data.items()]
+    rows.append({"dataset": "mean", **mean_row})
+    return {
+        "run_name": result_path.parent.name,
+        "result_json": str(result_path.resolve()),
+        "metric_names": metric_names,
+        "rows": rows,
+    }
+
+
+def render_output(summaries: list[dict], fmt: str) -> str:
+    if fmt == "json":
+        return json.dumps(summaries, indent=2, ensure_ascii=False)
+
+    blocks = []
+    for summary in summaries:
+        title = f"{summary['run_name']} ({summary['result_json']})"
+        if fmt == "markdown":
+            blocks.append(render_markdown_table(title, summary["rows"], summary["metric_names"]))
+        else:
+            blocks.append(render_text_table(title, summary["rows"], summary["metric_names"]))
+    return "\n\n".join(blocks)
+
+
+def main() -> int:
+    args = parse_args()
+    summaries = [build_summary(result_path, args.metrics) for result_path in args.result_json]
+    output = render_output(summaries, args.format)
+    print(output)
+
+    if args.save is not None:
+        args.save.parent.mkdir(parents=True, exist_ok=True)
+        args.save.write_text(output + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+### 18.3 这两份脚本分别解决什么问题
+
+`run_jittor_rn50_zoomnext_eval.sh` 解决的是“正式评测命令太长、每次容易敲错”的问题。
+
+它做的事情其实很简单：
+
+- 给 `scripts/test_jittor_rn50_zoomnext.py` 包一层默认参数
+- 默认测试四个常用数据集
+- 默认开启 CUDA
+- 默认保存预测图
+- 允许按命令行覆盖这些默认项
+
+这样正式评测时，最常用的命令可以压缩成：
+
+```bash
+bash scripts/run_jittor_rn50_zoomnext_eval.sh \
+  --ckpt outputs_jittor/.../step_000002.pkl
+```
+
+`summarize_jittor_eval_results.py` 解决的是“`eval_results.json` 机器可读但人眼不够直观”的问题。
+
+它支持：
+
+- 读一个或多个 `eval_results.json`
+- 自动补一行 `mean`
+- 输出为终端文本表格
+- 输出为 Markdown 表格
+- 可选写入文件
+
+这样后续你做多次实验时，就能把不同 run 的指标文件直接拉出来对比。
+
+### 18.4 推荐使用方式
+
+正式测试：
+
+```bash
+bash scripts/run_jittor_rn50_zoomnext_eval.sh \
+  --ckpt outputs_jittor/.../step_000002.pkl \
+  --batch-size 4 \
+  --test-datasets chameleon camo_te cod10k_te nc4k
+```
+
+结果汇总到终端：
+
+```bash
+python3 scripts/summarize_jittor_eval_results.py \
+  --result-json outputs_jittor_eval/.../eval_results.json
+```
+
+导出 Markdown 表格：
+
+```bash
+python3 scripts/summarize_jittor_eval_results.py \
+  --result-json outputs_jittor_eval/.../eval_results.json \
+  --format markdown \
+  --save outputs_jittor_eval/.../eval_summary.md
+```
+
+### 18.5 到这一步意味着什么
+
+这一轮完成后，Jittor 版 `resnet50` 路线已经具备了比较完整的实验链路：
+
+- 训练入口
+- checkpoint 保存
+- checkpoint 加载
+- 测试集推理
+- 指标统计
+- 预测图落盘
+- 结果汇总导出
+
+也就是说，后面你可以直接进入“正式训练 -> 正式评测 -> 汇总结果”的实验阶段，而不再只是做模块级迁移验证。
