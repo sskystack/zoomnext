@@ -2713,3 +2713,74 @@ PYTHONPATH=. python3 scripts/validate_jittor_difference_aware_ops.py
 - `DifferenceAwareOps` 验证脚本已新增
 
 但目前还没有收到 `DifferenceAwareOps` 的容器验证结果，因此它还不能算“已验证通过”。
+
+### 10.6 `DifferenceAwareOps` 验证结果
+
+你在 Ubuntu 容器中执行了：
+
+```bash
+python3 scripts/validate_jittor_difference_aware_ops.py
+```
+
+本次输出结果为：
+
+```json
+{
+  "name": "DifferenceAwareOps",
+  "shape": [10, 16, 11, 13],
+  "max_abs_err": 0.0,
+  "mean_abs_err": 0.0
+}
+```
+
+最终结论：
+
+```text
+Validation passed.
+```
+
+### 10.7 这次结果说明什么
+
+这次结果说明：
+
+1. 当前这版基于 Jittor 高层封装的 `DifferenceAwareOps` 已经与原 PyTorch 实现完全对齐
+2. 至少在本次验证配置下，`LayerNorm`、`Linear`、`Conv2d`、`Softmax`、`einsum` 这些高层接口的组合没有引入额外数值偏差
+3. 这一轮不需要退回到底层手工重写实现
+
+从结果上看：
+
+- `max_abs_err = 0.0`
+- `mean_abs_err = 0.0`
+
+这意味着当前验证下，PyTorch 与 Jittor 的输出完全一致。
+
+因此现在可以明确得出结论：
+
+> `DifferenceAwareOps` 已完成等价迁移，并通过了 Ubuntu 容器中的 PyTorch/Jittor 模块级对照验证。
+
+### 10.8 当前阶段状态更新
+
+截至当前，已经完成并验证通过的部分有：
+
+- 基础算子层
+  - `resize_to`
+  - `rescale_2x`
+  - `PixelNormalizer`
+  - `LayerNorm2d`
+  - `adaptive_avg_pool2d_pt`
+  - `adaptive_max_pool2d_pt`
+- 核心层
+  - `SimpleASPP`
+  - `MHSIU`
+  - `DifferenceAwareOps`
+
+仍未完成的模块：
+
+- `RGPU`
+- `ResNet50 backbone`
+- `RN50_ZoomNeXt` 整体前向
+
+下一步建议：
+
+继续迁移 `RGPU`。  
+因为它直接依赖 `DifferenceAwareOps`，现在时序差分模块已经验证通过，正是推进 `RGPU` 的合适时机。
