@@ -63,14 +63,17 @@ def main() -> int:
 
     try:
         import jittor as jt
-        from jittor import nn
     except ImportError as exc:
         raise SystemExit(
             "Jittor is not installed. Please install Jittor in the container before running this script."
         ) from exc
 
     from jittor_impl.models.layers_jt import MHSIU as JittorMHSIU
-    from jittor_impl.models.ops_jt import resize_to as jittor_resize_to
+    from jittor_impl.models.ops_jt import (
+        adaptive_avg_pool2d_pt as jittor_adaptive_avg_pool2d_pt,
+        adaptive_max_pool2d_pt as jittor_adaptive_max_pool2d_pt,
+        resize_to as jittor_resize_to,
+    )
 
     jt.flags.use_cuda = 0
 
@@ -121,7 +124,7 @@ def main() -> int:
     jt_out = {}
     tgt_size_jt = (int(m_jt.shape[2]), int(m_jt.shape[3]))
     jt_out["l_pre"] = jt_model.conv_l_pre(l_jt)
-    jt_out["l_pool"] = nn.AdaptiveMaxPool2d(tgt_size_jt)(jt_out["l_pre"]) + nn.AdaptiveAvgPool2d(tgt_size_jt)(jt_out["l_pre"])
+    jt_out["l_pool"] = jittor_adaptive_max_pool2d_pt(jt_out["l_pre"], tgt_size_jt) + jittor_adaptive_avg_pool2d_pt(jt_out["l_pre"], tgt_size_jt)
     jt_out["s_pre"] = jt_model.conv_s_pre(s_jt)
     jt_out["s_resize"] = jittor_resize_to(jt_out["s_pre"], tgt_hw=tgt_size_jt)
     jt_out["l_branch"] = jt_model.conv_l(jt_out["l_pool"])

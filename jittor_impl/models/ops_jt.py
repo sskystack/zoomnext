@@ -34,6 +34,42 @@ def global_avgpool(x: jt.Var) -> jt.Var:
     return x.mean(dims=(-1, -2), keepdims=True)
 
 
+def _adaptive_pool2d_slice_bounds(input_size: int, output_size: int, idx: int) -> Tuple[int, int]:
+    start = math.floor(idx * input_size / output_size)
+    end = math.ceil((idx + 1) * input_size / output_size)
+    return start, end
+
+
+def adaptive_avg_pool2d_pt(x: jt.Var, output_size: tuple) -> jt.Var:
+    out_h, out_w = int(output_size[0]), int(output_size[1])
+    in_h, in_w = int(x.shape[2]), int(x.shape[3])
+    rows = []
+    for oh in range(out_h):
+        hs, he = _adaptive_pool2d_slice_bounds(in_h, out_h, oh)
+        cols = []
+        for ow in range(out_w):
+            ws, we = _adaptive_pool2d_slice_bounds(in_w, out_w, ow)
+            region = x[:, :, hs:he, ws:we]
+            cols.append(region.mean(dims=(2, 3), keepdims=True))
+        rows.append(jt.concat(cols, dim=3))
+    return jt.concat(rows, dim=2)
+
+
+def adaptive_max_pool2d_pt(x: jt.Var, output_size: tuple) -> jt.Var:
+    out_h, out_w = int(output_size[0]), int(output_size[1])
+    in_h, in_w = int(x.shape[2]), int(x.shape[3])
+    rows = []
+    for oh in range(out_h):
+        hs, he = _adaptive_pool2d_slice_bounds(in_h, out_h, oh)
+        cols = []
+        for ow in range(out_w):
+            ws, we = _adaptive_pool2d_slice_bounds(in_w, out_w, ow)
+            region = x[:, :, hs:he, ws:we]
+            cols.append(region.max(dims=(2, 3), keepdims=True))
+        rows.append(jt.concat(cols, dim=3))
+    return jt.concat(rows, dim=2)
+
+
 class _LeakyReLU(nn.Module):
     def __init__(self, negative_slope: float = 0.1):
         super().__init__()

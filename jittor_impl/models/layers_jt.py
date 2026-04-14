@@ -9,7 +9,7 @@ from __future__ import annotations
 import jittor as jt
 from jittor import nn
 
-from .ops_jt import ConvBNReLU, resize_to
+from .ops_jt import ConvBNReLU, adaptive_avg_pool2d_pt, adaptive_max_pool2d_pt, resize_to
 
 
 class SimpleASPP(nn.Module):
@@ -89,7 +89,7 @@ class MHSIU(nn.Module):
         tgt_size = (int(m.shape[2]), int(m.shape[3]))
 
         l = self.conv_l_pre(l)
-        l = nn.AdaptiveMaxPool2d(tgt_size)(l) + nn.AdaptiveAvgPool2d(tgt_size)(l)
+        l = adaptive_max_pool2d_pt(l, tgt_size) + adaptive_avg_pool2d_pt(l, tgt_size)
         s = self.conv_s_pre(s)
         s = resize_to(s, tgt_hw=tgt_size)
 

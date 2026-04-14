@@ -2107,3 +2107,145 @@ python3 scripts/debug_jittor_mhsiu.py
 - 是池化/resize 分支先开始漂
 - 还是 `attn_reshape` 这一步开始漂
 - 或者是 `trans` 子模块之后开始漂
+
+### 9.14 中间张量调试结果与最终问题定位
+
+你运行了：
+
+```bash
+python3 scripts/debug_jittor_mhsiu.py
+```
+
+返回的关键结果是：
+
+```json
+[
+  {
+    "name": "l_pre",
+    "max_abs_err": 2.384185791015625e-07,
+    "mean_abs_err": 1.3001153931213594e-08
+  },
+  {
+    "name": "l_pool",
+    "max_abs_err": 2.3653676509857178,
+    "mean_abs_err": 0.6327974796295166
+  },
+  {
+    "name": "s_pre",
+    "max_abs_err": 1.1920928955078125e-07,
+    "mean_abs_err": 1.2431767615339595e-08
+  },
+  {
+    "name": "s_resize",
+    "max_abs_err": 3.5762786865234375e-07,
+    "mean_abs_err": 1.7358381398935308e-08
+  }
+]
+```
+
+从这个结果可以非常明确地看出：
+
+- `l_pre` 是对齐的
+- `s_pre` 是对齐的
+- `s_resize` 是对齐的
+- 但 `l_pool` 在刚进入自适应池化后就已经出现巨大偏差
+
+这说明当前 `MHSIU` 误差的源头不是：
+
+- 卷积层
+- BN
+- 小尺度分支 resize
+- 后面的 `attn` 重排
+
+而是：
+
+> Jittor 自带的 `AdaptiveMaxPool2d` / `AdaptiveAvgPool2d` 与 PyTorch 的自适应池化语义不一致。
+
+### 9.15 这为什么是关键结论
+
+这一步非常重要，因为它说明了：
+
+- 当前不能继续用 Jittor 原生 `AdaptiveMaxPool2d` / `AdaptiveAvgPool2d` 直接替换 PyTorch
+- 如果坚持直接替换，即使后面所有卷积和重排都完全正确，`MHSIU` 仍然不可能数值对齐
+
+也就是说，这不是“实现写得不够像”，而是：
+
+> 两个框架的自适应池化本身就不是同一个算法语义。
+
+### 9.16 针对该问题的修复
+
+为保证“等价迁移”，本轮在 `jittor_impl/models/ops_jt.py` 中新增了两个严格按 PyTorch 区间公式实现的池化函数：
+
+```python
+def _adaptive_pool2d_slice_bounds(input_size: int, output_size: int, idx: int) -> Tuple[int, int]:
+    start = math.floor(idx * input_size / output_size)
+    end = math.ceil((idx + 1) * input_size / output_size)
+    return start, end
+
+
+def adaptive_avg_pool2d_pt(x: jt.Var, output_size: tuple) -> jt.Var:
+    out_h, out_w = int(output_size[0]), int(output_size[1])
+    in_h, in_w = int(x.shape[2]), int(x.shape[3])
+    rows = []
+    for oh in range(out_h):
+        hs, he = _adaptive_pool2d_slice_bounds(in_h, out_h, oh)
+        cols = []
+        for ow in range(out_w):
+            ws, we = _adaptive_pool2d_slice_bounds(in_w, out_w, ow)
+            region = x[:, :, hs:he, ws:we]
+            cols.append(region.mean(dims=(2, 3), keepdims=True))
+        rows.append(jt.concat(cols, dim=3))
+    return jt.concat(rows, dim=2)
+
+
+def adaptive_max_pool2d_pt(x: jt.Var, output_size: tuple) -> jt.Var:
+    out_h, out_w = int(output_size[0]), int(output_size[1])
+    in_h, in_w = int(x.shape[2]), int(x.shape[3])
+    rows = []
+    for oh in range(out_h):
+        hs, he = _adaptive_pool2d_slice_bounds(in_h, out_h, oh)
+        cols = []
+        for ow in range(out_w):
+            ws, we = _adaptive_pool2d_slice_bounds(in_w, out_w, ow)
+            region = x[:, :, hs:he, ws:we]
+            cols.append(region.max(dims=(2, 3), keepdims=True))
+        rows.append(jt.concat(cols, dim=3))
+    return jt.concat(rows, dim=2)
+```
+
+这两个函数的核心思想是：
+
+- 对每个输出格子显式计算 PyTorch 自适应池化所用的输入区间
+- 再在对应窗口上做 `mean` 或 `max`
+- 最后拼回输出特征图
+
+这一步虽然写法比直接调用框架算子更长，但这是为了保证和 PyTorch 语义完全一致，不属于“简化实现”。
+
+### 9.17 `MHSIU` 中的对应替换
+
+原先写法：
+
+```python
+l = nn.AdaptiveMaxPool2d(tgt_size)(l) + nn.AdaptiveAvgPool2d(tgt_size)(l)
+```
+
+现在改为：
+
+```python
+l = adaptive_max_pool2d_pt(l, tgt_size) + adaptive_avg_pool2d_pt(l, tgt_size)
+```
+
+这一步的意义是：
+
+- 不再依赖 Jittor 原生自适应池化的实现细节
+- 直接用 PyTorch 兼容公式保证输出一致性
+
+### 9.18 下一次验证命令
+
+修复之后，请重新验证：
+
+```bash
+python3 scripts/validate_jittor_mhsiu.py
+```
+
+如果这次误差显著下降，就说明我们已经抓到了 `MHSIU` 的主要误差源。
