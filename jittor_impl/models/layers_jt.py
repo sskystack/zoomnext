@@ -86,7 +86,7 @@ class MHSIU(nn.Module):
         )
 
     def execute(self, l: jt.Var, m: jt.Var, s: jt.Var) -> jt.Var:
-        tgt_size = m.shape[2:]
+        tgt_size = (int(m.shape[2]), int(m.shape[3]))
 
         l = self.conv_l_pre(l)
         l = nn.AdaptiveMaxPool2d(tgt_size)(l) + nn.AdaptiveAvgPool2d(tgt_size)(l)

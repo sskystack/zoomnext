@@ -1715,3 +1715,68 @@ PYTHONPATH=. python3 scripts/validate_jittor_mhsiu.py
 - `MHSIU` 验证脚本已新增
 
 但目前还没有收到 `MHSIU` 的容器验证结果，因此它还不能算“已验证通过”。
+
+### 9.6 第一轮 `MHSIU` 验证结果与问题定位
+
+你在 Ubuntu 容器中执行了：
+
+```bash
+python3 scripts/validate_jittor_mhsiu.py
+```
+
+出现的关键报错是：
+
+```text
+TypeError: AdaptiveMaxPool2d only support int, tuple or list input. Not support <class 'jittor_core.NanoVector'> yet.
+```
+
+报错位置在：
+
+```python
+l = nn.AdaptiveMaxPool2d(tgt_size)(l) + nn.AdaptiveAvgPool2d(tgt_size)(l)
+```
+
+问题原因：
+
+我最初写的是：
+
+```python
+tgt_size = m.shape[2:]
+```
+
+在 PyTorch 里，这样通常会得到可直接使用的尺寸元组；  
+但在 Jittor 里，`m.shape[2:]` 返回的是 `NanoVector`，不能直接传给 `AdaptiveMaxPool2d` 和 `AdaptiveAvgPool2d`。
+
+因此这次失败说明的不是 `MHSIU` 逻辑错误，而是：
+
+- Jittor 的 shape 对象类型和 PyTorch 不同
+- 需要先把目标尺寸显式转换成 Python `tuple(int, int)`
+
+### 9.7 针对本次失败的修复
+
+本次修复内容如下：
+
+```python
+def execute(self, l: jt.Var, m: jt.Var, s: jt.Var) -> jt.Var:
+    tgt_size = (int(m.shape[2]), int(m.shape[3]))
+```
+
+修复意义：
+
+- 把 Jittor 的 `NanoVector` 转成标准 Python 尺寸元组
+- 让自适应池化接口与原始 PyTorch 写法保持等价语义
+- 排除由框架接口差异导致的非模型逻辑错误
+
+### 9.8 修复后的下一次验证命令
+
+修复后请重新验证：
+
+```bash
+python3 scripts/validate_jittor_mhsiu.py
+```
+
+新的结果回传后，需要重点观察：
+
+- 是否还会出现 shape 类型相关报错
+- 是否能成功跑出 `max_abs_err` 和 `mean_abs_err`
+- 误差是否进入 `1e-5` / `1e-6` 阈值范围
