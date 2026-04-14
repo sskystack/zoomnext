@@ -9,11 +9,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import random
+import sys
 from typing import Dict, Tuple
 
 import numpy as np
 import torch
+
+# Make the repo root importable even when this script is executed via
+# `python scripts/validate_jittor_ops.py`.
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from methods.zoomnext.ops import LayerNorm2d as TorchLayerNorm2d
 from methods.zoomnext.ops import PixelNormalizer as TorchPixelNormalizer
