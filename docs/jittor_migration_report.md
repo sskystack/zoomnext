@@ -5802,3 +5802,75 @@ forward_ algorithm cache is full
 - 是否打印出 `iter/loss/lr`
 - 是否能跑满 `2` 个 iter
 - 是否能保存 checkpoint
+
+### 14.17 最小训练中的 `doesn't have gradient` 警告说明
+
+用户继续观察到如下警告：
+
+```text
+[w ...] grads[128] 'hmu_5.fuse_diff.temperal_proj_kv.weight' doesn't have gradient. It will be set to zero
+[w ...] grads[129] 'hmu_5.fuse_diff.temperal_proj.0.weight' doesn't have gradient. It will be set to zero
+[w ...] grads[130] 'hmu_5.fuse_diff.temperal_proj.2.weight' doesn't have gradient. It will be set to zero
+...
+[w ...] grads[380] 'hmu_1.fuse_diff.temperal_proj_kv.weight' doesn't have gradient. It will be set to zero
+[w ...] grads[381] 'hmu_1.fuse_diff.temperal_proj.0.weight' doesn't have gradient. It will be set to zero
+[w ...] grads[382] 'hmu_1.fuse_diff.temperal_proj.2.weight' doesn't have gradient. It will be set to zero
+```
+
+#### 这是不是设计错误
+
+不是设计错误。
+
+这些没有梯度的参数全部都来自：
+
+- `hmu_x.fuse_diff.temperal_proj_kv.weight`
+- `hmu_x.fuse_diff.temperal_proj.0.weight`
+- `hmu_x.fuse_diff.temperal_proj.2.weight`
+
+也就是 `RGPU -> DifferenceAwareOps` 里的时序差分分支参数。
+
+而 `DifferenceAwareOps` 的原始逻辑本来就是：
+
+```python
+if self.num_frames == 1:
+    return x
+```
+
+当前 image 训练入口里使用的是：
+
+```python
+num_frames = 1
+```
+
+这意味着在单帧图像训练时，`DifferenceAwareOps` 会直接返回输入，后面的：
+
+- `temperal_proj_kv`
+- `temperal_proj`
+
+根本不会参与前向图，因此这些参数自然不会产生梯度。
+
+#### 为什么 PyTorch 训练里不明显，而 Jittor 会提示
+
+这更像是框架提示风格差异：
+
+- PyTorch 通常只是让这些参数的 `grad` 保持 `None`
+- Jittor 会显式提示“这个参数没有梯度，将被置零”
+
+所以当前看到的是 Jittor 对“未参与当前图”的参数给出的运行时提醒，而不是模型结构错误。
+
+#### 这说明什么
+
+这恰好说明当前迁移在这个点上和原设计是一致的：
+
+1. 对单帧图像任务，时序差分分支本来就不应该工作
+2. 因此这些时序参数在 `num_frames=1` 时没有梯度是符合原始设计的
+3. 如果切到视频设置 `num_frames>1`，这些参数才会进入计算图并获得梯度
+
+#### 后续怎么处理
+
+当前阶段不把这类 warning 当成错误处理，因为它不影响正确性。  
+如果后面希望减少训练日志噪音，可以再做一个“工程化优化”：
+
+- 在 `num_frames == 1` 时，把这些时序参数从 optimizer 中排除
+
+但这属于日志和工程优化，不属于当前“等价迁移”必须修复的问题。
