@@ -3294,3 +3294,83 @@ PYTHONPATH=. python3 scripts/validate_jittor_rgpu.py
 - `RGPU` 验证脚本已新增
 
 但目前还没有收到 `RGPU` 的容器验证结果，因此它还不能算“已验证通过”。
+
+### 11.6 `RGPU` 验证结果
+
+你在 Ubuntu 容器中执行了：
+
+```bash
+python3 scripts/validate_jittor_rgpu.py
+```
+
+本次输出结果为：
+
+```json
+{
+  "name": "RGPU",
+  "shape": [10, 16, 11, 13],
+  "max_abs_err": 1.1920928955078125e-07,
+  "mean_abs_err": 2.749561411885537e-10
+}
+```
+
+最终结论：
+
+```text
+Validation passed.
+```
+
+### 11.7 这次结果说明什么
+
+这次结果说明：
+
+1. 当前 `RGPU` 的 Jittor 实现已经与原 PyTorch 实现数值对齐
+2. 前面分别完成并验证通过的 `DifferenceAwareOps`、`ConvBNReLU`、门控路径等部件，在 `RGPU` 组合后依然保持一致
+3. 当前这版 `RGPU` 不需要进一步回退到更底层手工实现
+
+从误差量级看：
+
+- `max_abs_err = 1.19e-07`
+- `mean_abs_err = 2.75e-10`
+
+这远低于模块验证阈值：
+
+- `tol-max = 1e-5`
+- `tol-mean = 1e-6`
+
+因此现在可以明确得出结论：
+
+> `RGPU` 已完成等价迁移，并通过了 Ubuntu 容器中的 PyTorch/Jittor 模块级对照验证。
+
+### 11.8 当前阶段状态更新
+
+截至当前，`methods/zoomnext/layers.py` 中和 `RN50_ZoomNeXt` 相关的 4 个核心模块都已经完成并验证通过：
+
+- `SimpleASPP`
+- `MHSIU`
+- `DifferenceAwareOps`
+- `RGPU`
+
+加上前面已经完成的基础算子层，目前已经完成并验证通过的部分有：
+
+- 基础算子层
+  - `resize_to`
+  - `rescale_2x`
+  - `PixelNormalizer`
+  - `LayerNorm2d`
+  - `adaptive_avg_pool2d_pt`
+  - `adaptive_max_pool2d_pt`
+- 核心层
+  - `SimpleASPP`
+  - `MHSIU`
+  - `DifferenceAwareOps`
+  - `RGPU`
+
+仍未完成的模块：
+
+- `ResNet50 backbone`
+- `RN50_ZoomNeXt` 整体前向
+
+下一步建议：
+
+开始迁移 `ResNet50 backbone`，然后再拼接出 `RN50_ZoomNeXt` 的完整 Jittor 版前向。
