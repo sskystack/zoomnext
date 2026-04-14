@@ -69,15 +69,16 @@ def map_torch_state_dict_to_jittor(state_dict: dict) -> dict:
             continue
 
         mapped_name = name
-        mapped_name = mapped_name.replace("gate_genator.1.", "gate_conv1.")
-        mapped_name = mapped_name.replace("gate_genator.3.", "gate_conv2.")
-        mapped_name = mapped_name.replace("fuse.0.", "fuse_diff.")
-        mapped_name = mapped_name.replace("fuse.1.", "fuse_conv.")
-        for group_id in range(100):
-            prefix = f"interact.{group_id}."
-            if prefix in mapped_name:
-                mapped_name = mapped_name.replace(prefix, f"interact_{group_id}.")
-                break
+        if mapped_name.startswith("hmu_"):
+            mapped_name = mapped_name.replace("gate_genator.1.", "gate_conv1.")
+            mapped_name = mapped_name.replace("gate_genator.3.", "gate_conv2.")
+            mapped_name = mapped_name.replace("fuse.0.", "fuse_diff.")
+            mapped_name = mapped_name.replace("fuse.1.", "fuse_conv.")
+            for group_id in range(100):
+                prefix = f"interact.{group_id}."
+                if prefix in mapped_name:
+                    mapped_name = mapped_name.replace(prefix, f"interact_{group_id}.")
+                    break
         mapped[mapped_name] = value.detach().cpu().numpy()
     return mapped
 

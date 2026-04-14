@@ -4535,3 +4535,138 @@ python3 scripts/validate_jittor_rn50_zoomnext.py --encoder-weight-path pretraine
 
 这一步代码已经写完，并且本地通过了 Python 语法静态检查。  
 但由于当前本地开发环境没有安装 Jittor，也没有 `einops` 来直接运行 PyTorch 参考整网，所以整网数值对照结果需要以 Ubuntu 容器里的实际输出为准。
+
+### 13.8 Ubuntu 容器首次 `RN50_ZoomNeXt_JT` 验证结果与问题定位
+
+用户在 Ubuntu 容器中执行：
+
+```bash
+python3 scripts/validate_jittor_rn50_zoomnext.py
+```
+
+得到的核心输出如下：
+
+```text
+[w] load parameter tra_5.fuse_diff.conv.weight failed ...
+[w] load parameter tra_5.fuse_diff.bn.weight failed ...
+[w] load parameter tra_5.fuse_diff.bn.bias failed ...
+[w] load parameter tra_5.fuse_diff.bn.running_mean failed ...
+[w] load parameter tra_5.fuse_diff.bn.running_var failed ...
+[w] load parameter tra_5.fuse_conv.conv.weight failed ...
+[w] load parameter tra_5.fuse_conv.bn.weight failed ...
+[w] load parameter tra_5.fuse_conv.bn.bias failed ...
+[w] load parameter tra_5.fuse_conv.bn.running_mean failed ...
+[w] load parameter tra_5.fuse_conv.bn.running_var failed ...
+[w] load total 947 params, 10 failed
+```
+
+以及最终数值结果：
+
+```json
+{
+  "name": "RN50_ZoomNeXt",
+  "shape": [
+    2,
+    1,
+    352,
+    352
+  ],
+  "max_abs_err": 0.0003956109285354614,
+  "mean_abs_err": 6.341702828649431e-05
+}
+
+Validation failed: max_abs_err=3.956109e-04, mean_abs_err=6.341703e-05
+```
+
+#### 为什么会有这 10 个 `load failed`
+
+这 10 个失败并不是“整网很多地方都没对齐”，而是同一个问题集中出在 `tra_5.fuse` 上。
+
+`SimpleASPP` 里的 `fuse` 本来是：
+
+```text
+tra_5.fuse.0.*
+tra_5.fuse.1.*
+```
+
+但整网验证脚本里为了兼容 `RGPU`，做了一个全局替换：
+
+```python
+mapped_name = mapped_name.replace("fuse.0.", "fuse_diff.")
+mapped_name = mapped_name.replace("fuse.1.", "fuse_conv.")
+```
+
+这个替换范围太大了，它不只改了 `hmu_x.fuse.*`，还误伤了 `tra_5.fuse.*`。  
+于是 PyTorch 里的：
+
+```text
+tra_5.fuse.0.*
+tra_5.fuse.1.*
+```
+
+被错误映射成了：
+
+```text
+tra_5.fuse_diff.*
+tra_5.fuse_conv.*
+```
+
+而 `SimpleASPP` 在 Jittor 中并没有这两个名字，所以这 10 个参数会全部加载失败。
+
+#### 这说明什么
+
+这次失败说明的不是：
+
+- `RN50_ZoomNeXt_JT` 拓扑错误
+- `ResNet50 backbone` 出错
+- `MHSIU` / `RGPU` 子模块本身回归失败
+
+而是：
+
+- 整网验证脚本里的权重映射写得过宽
+- `RGPU` 专用的 `fuse` 重命名规则误作用到了 `SimpleASPP`
+
+### 13.9 针对本次问题的修复
+
+修复方式是不再对整个模型做无条件 `fuse.*` 替换，而是只在 `hmu_` 前缀下做这些 RGPU 专属映射：
+
+```python
+def map_torch_state_dict_to_jittor(state_dict: dict) -> dict:
+    mapped = {}
+    for name, value in state_dict.items():
+        if name in {"normalizer.mean", "normalizer.std"}:
+            continue
+
+        mapped_name = name
+        if mapped_name.startswith("hmu_"):
+            mapped_name = mapped_name.replace("gate_genator.1.", "gate_conv1.")
+            mapped_name = mapped_name.replace("gate_genator.3.", "gate_conv2.")
+            mapped_name = mapped_name.replace("fuse.0.", "fuse_diff.")
+            mapped_name = mapped_name.replace("fuse.1.", "fuse_conv.")
+            for group_id in range(100):
+                prefix = f"interact.{group_id}."
+                if prefix in mapped_name:
+                    mapped_name = mapped_name.replace(prefix, f"interact_{group_id}.")
+                    break
+        mapped[mapped_name] = value.detach().cpu().numpy()
+    return mapped
+```
+
+这个修改的意义是：
+
+1. `RGPU` 继续保留需要的专用映射
+2. `SimpleASPP` 的 `tra_5.fuse.0/1` 不再被误改名
+3. 整网权重可以按真实模块归属正确加载
+
+### 13.10 修复后的下一次验证命令
+
+请在 Ubuntu 容器中重新执行：
+
+```bash
+python3 scripts/validate_jittor_rn50_zoomnext.py
+```
+
+新的结果回传后，需要重点观察两点：
+
+1. 是否还存在 `tra_5.fuse_*` 相关的 `load failed`
+2. 整网 `max_abs_err` 与 `mean_abs_err` 是否明显下降
