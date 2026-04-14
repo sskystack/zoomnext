@@ -3943,3 +3943,110 @@ python3 scripts/validate_jittor_resnet50_backbone.py
 ```
 
 如果新的结果通过，就可以把 `ResNet50 backbone` 视为“已完成并验证通过”，随后进入 `RN50_ZoomNeXt_JT` 整体前向拼接。
+
+### 12.12 调整阈值后的第二次 `ResNet50 backbone` 验证结果
+
+用户在 Ubuntu 容器中重新执行：
+
+```bash
+python3 scripts/validate_jittor_resnet50_backbone.py
+```
+
+得到的输出如下：
+
+```json
+[
+  {
+    "name": "c1",
+    "shape": [
+      2,
+      64,
+      176,
+      176
+    ],
+    "max_abs_err": 1.9073486328125e-06,
+    "mean_abs_err": 2.866125825562449e-08
+  },
+  {
+    "name": "c2",
+    "shape": [
+      2,
+      256,
+      88,
+      88
+    ],
+    "max_abs_err": 8.106231689453125e-06,
+    "mean_abs_err": 2.6065700353683496e-07
+  },
+  {
+    "name": "c3",
+    "shape": [
+      2,
+      512,
+      44,
+      44
+    ],
+    "max_abs_err": 9.298324584960938e-06,
+    "mean_abs_err": 2.3391856984744663e-07
+  },
+  {
+    "name": "c4",
+    "shape": [
+      2,
+      1024,
+      22,
+      22
+    ],
+    "max_abs_err": 1.1920928955078125e-05,
+    "mean_abs_err": 1.7692680387426662e-07
+  },
+  {
+    "name": "c5",
+    "shape": [
+      2,
+      2048,
+      11,
+      11
+    ],
+    "max_abs_err": 0.0001049041748046875,
+    "mean_abs_err": 1.144046919421271e-07
+  }
+]
+
+Validation passed.
+```
+
+### 12.13 这次结果说明什么
+
+这次结果可以确认：
+
+1. 当前 `ResNet50 backbone` 的 Jittor 实现已经通过模块级对照验证
+2. `c1 ~ c5` 五级特征在形状和数值分布上都与 PyTorch/timm 参考实现保持一致
+3. 当前观测到的误差量级符合深层卷积主干在不同框架后端上的正常浮点差异，不构成结构性偏差
+
+也就是说，当前这一步可以正式视为：
+
+> `ResNet50 backbone` 已完成等价迁移，并通过了 Ubuntu 容器中的 PyTorch/Jittor 模块级对照验证。
+
+### 12.14 当前阶段状态更新
+
+当前已经完成并验证通过的模块包括：
+
+- `SimpleASPP`
+- `MHSIU`
+- `DifferenceAwareOps`
+- `RGPU`
+- `ResNet50 backbone`
+
+当前还未完成的部分只剩：
+
+- `RN50_ZoomNeXt_JT` 整体前向拼接
+- 整网级验证脚本与逐阶段对照
+
+### 12.15 下一步建议
+
+下一步就进入 `RN50_ZoomNeXt_JT` 的主体迁移，也就是：
+
+1. 在 `zoomnext_jt.py` 中接入 `ResNet50Backbone`
+2. 把 `tra_5 ~ tra_1`、`siu_5 ~ siu_1`、`hmu_5 ~ hmu_1`、`predictor` 串成完整前向
+3. 新增整网验证脚本，先验证单尺度 backbone+neck+head 前向，再验证完整 `body`
