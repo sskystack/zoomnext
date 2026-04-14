@@ -3374,3 +3374,454 @@ Validation passed.
 下一步建议：
 
 开始迁移 `ResNet50 backbone`，然后再拼接出 `RN50_ZoomNeXt` 的完整 Jittor 版前向。
+
+## 12. 第六轮更新：迁移 `ResNet50 backbone`
+
+这一轮开始正式迁移 `RN50_ZoomNeXt` 的骨干网络部分，也就是当前范围内唯一需要支持的 `resnet50` backbone。
+
+这一轮的目标是：
+
+- 把 `timm.create_model("resnet50", features_only=True, out_indices=range(5))` 对应的特征提取行为，等价迁移到 Jittor
+- 保持与本地预训练权重 `pretrained_weights/resnet50-timm.pth` 的参数命名兼容
+- 新增独立的 backbone 验证脚本，让 Ubuntu 容器可以直接对比 `c1` 到 `c5`
+
+这一轮仍然不包括：
+
+- `RN50_ZoomNeXt` 整网 Jittor 前向拼接
+- 多尺度输入链路与 predictor 的整体验证
+
+### 12.1 本轮修改的文件
+
+- `jittor_impl/models/backbone/resnet50_jt.py`
+- `jittor_impl/models/backbone/__init__.py`
+- `scripts/validate_jittor_resnet50_backbone.py`
+
+### 12.2 `jittor_impl/models/backbone/resnet50_jt.py` 最新完整代码
+
+```python
+"""Jittor ResNet50 backbone migrated from the PyTorch/timm reference.
+
+This module keeps the canonical torchvision-style naming convention so
+that the pretrained `resnet50-timm.pth` weights can be loaded directly.
+The backbone returns five feature levels that match
+`timm.create_model(..., features_only=True, out_indices=range(5))`:
+
+- c1: stem output after `conv1 + bn1 + relu`, before max-pool
+- c2: output of `layer1`
+- c3: output of `layer2`
+- c4: output of `layer3`
+- c5: output of `layer4`
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+
+import jittor as jt
+from jittor import nn
+
+
+def _conv3x3(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+    return nn.Conv2d(
+        in_planes,
+        out_planes,
+        kernel_size=3,
+        stride=stride,
+        padding=1,
+        bias=False,
+    )
+
+
+def _conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+    return nn.Conv2d(
+        in_planes,
+        out_planes,
+        kernel_size=1,
+        stride=stride,
+        bias=False,
+    )
+
+
+def torch_state_dict_to_numpy(state_dict: Dict[str, object]) -> Dict[str, np.ndarray]:
+    converted = {}
+    for name, value in state_dict.items():
+        if hasattr(value, "detach"):
+            converted[name] = value.detach().cpu().numpy()
+        else:
+            converted[name] = np.asarray(value)
+    return converted
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(
+        self,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: Optional[nn.Module] = None,
+    ) -> None:
+        super().__init__()
+        self.conv1 = _conv1x1(inplanes, planes)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = _conv3x3(planes, planes, stride=stride)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = _conv1x1(planes, planes * self.expansion)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.relu = nn.ReLU()
+        self.downsample = downsample
+        self.stride = stride
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out = out + identity
+        out = self.relu(out)
+        return out
+
+
+class ResNet50Backbone(nn.Module):
+    feature_channels = (64, 256, 512, 1024, 2048)
+
+    def __init__(self, pretrained: bool = False, weight_path: Optional[str] = None) -> None:
+        super().__init__()
+        self.inplanes = 64
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.layer1 = self._make_layer(planes=64, blocks=3)
+        self.layer2 = self._make_layer(planes=128, blocks=4, stride=2)
+        self.layer3 = self._make_layer(planes=256, blocks=6, stride=2)
+        self.layer4 = self._make_layer(planes=512, blocks=3, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * Bottleneck.expansion, 1000)
+
+        if pretrained:
+            self.load_torch_pretrained(weight_path=weight_path)
+
+    def _make_layer(self, planes: int, blocks: int, stride: int = 1) -> nn.Sequential:
+        downsample = None
+        outplanes = planes * Bottleneck.expansion
+        if stride != 1 or self.inplanes != outplanes:
+            downsample = nn.Sequential()
+            downsample.add_module("0", _conv1x1(self.inplanes, outplanes, stride=stride))
+            downsample.add_module("1", nn.BatchNorm2d(outplanes))
+
+        layers = nn.Sequential()
+        layers.add_module("0", Bottleneck(self.inplanes, planes, stride=stride, downsample=downsample))
+        self.inplanes = outplanes
+        for block_idx in range(1, blocks):
+            layers.add_module(str(block_idx), Bottleneck(self.inplanes, planes))
+        return layers
+
+    def forward_features(self, x: jt.Var) -> Tuple[jt.Var, jt.Var, jt.Var, jt.Var, jt.Var]:
+        x = self.conv1(x)
+        x = self.bn1(x)
+        c1 = self.relu(x)
+
+        x = self.maxpool(c1)
+        c2 = self.layer1(x)
+        c3 = self.layer2(c2)
+        c4 = self.layer3(c3)
+        c5 = self.layer4(c4)
+        return c1, c2, c3, c4, c5
+
+    def forward_head(self, c5: jt.Var) -> jt.Var:
+        x = self.avgpool(c5)
+        x = x.reshape((x.shape[0], -1))
+        return self.fc(x)
+
+    def execute(self, x: jt.Var) -> Tuple[jt.Var, jt.Var, jt.Var, jt.Var, jt.Var]:
+        return self.forward_features(x)
+
+    def load_torch_pretrained(self, weight_path: Optional[str] = None) -> None:
+        if weight_path is None:
+            weight_path = str(Path(__file__).resolve().parents[3] / "pretrained_weights" / "resnet50-timm.pth")
+
+        weight_file = Path(weight_path)
+        if not weight_file.is_file():
+            raise FileNotFoundError(f"Cannot find ResNet50 pretrained weights: {weight_file}")
+
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError(
+                "Loading the PyTorch-format ResNet50 checkpoint requires torch to be installed."
+            ) from exc
+
+        state_dict = torch.load(str(weight_file), map_location="cpu")
+        if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+            state_dict = state_dict["state_dict"]
+
+        self.load_state_dict(torch_state_dict_to_numpy(state_dict))
+
+
+def build_resnet50(pretrained: bool = False, weight_path: Optional[str] = None) -> ResNet50Backbone:
+    return ResNet50Backbone(pretrained=pretrained, weight_path=weight_path)
+
+
+def extract_features(model: ResNet50Backbone, x: jt.Var) -> Tuple[jt.Var, jt.Var, jt.Var, jt.Var, jt.Var]:
+    return model(x)
+```
+
+#### 这一版 backbone 是怎么对齐 PyTorch 版的
+
+这里不是直接“随便搭一个能跑的 ResNet50”，而是按当前 PyTorch/timm 参考实现的关键结构去对齐：
+
+1. stem 部分保持 `conv1 -> bn1 -> relu -> maxpool`
+2. 四个 stage 采用标准 `Bottleneck` 深度：`[3, 4, 6, 3]`
+3. 每个 block 和 `downsample` 都沿用 torchvision/timm 兼容命名
+4. 保留 `avgpool` 和 `fc`，这样本地的 `resnet50-timm.pth` 可以直接按标准键名加载，而不是做额外的裁剪转换
+
+#### 为什么 `c1` 放在 maxpool 之前
+
+这是因为当前项目里的 PyTorch 版 backbone 不是自己手写的 `forward_features`，而是：
+
+```python
+timm.create_model("resnet50", features_only=True, out_indices=range(5), pretrained=False)
+```
+
+对这个模型做实际检查后，`352x352` 输入返回的五级特征形状是：
+
+```text
+c1: (1, 64, 176, 176)
+c2: (1, 256, 88, 88)
+c3: (1, 512, 44, 44)
+c4: (1, 1024, 22, 22)
+c5: (1, 2048, 11, 11)
+```
+
+这说明第一层特征确实是 stem 激活后的输出，而不是 maxpool 之后的输出。  
+所以这里必须按这个层级返回，否则后面 `tra_1 ~ tra_5` 的输入尺度就会整体错位。
+
+#### 为什么保留标准键名
+
+本地已经确认：
+
+```text
+conv1.weight
+bn1.weight
+layer1.0.conv1.weight
+layer1.0.downsample.0.weight
+fc.weight
+```
+
+这些键都存在于 `pretrained_weights/resnet50-timm.pth` 中。  
+因此只要 Jittor 版的模块注册名保持一致，就可以直接加载 PyTorch/timm 权重，而不需要像 `RGPU` 那样专门写一层复杂映射。
+
+### 12.3 `jittor_impl/models/backbone/__init__.py` 最新完整代码
+
+```python
+"""Backbone modules for the Jittor ZoomNeXt migration."""
+
+from .resnet50_jt import ResNet50Backbone, build_resnet50, extract_features
+
+__all__ = ["ResNet50Backbone", "build_resnet50", "extract_features"]
+```
+
+这部分很简单，作用是把 `ResNet50Backbone` 以及两个辅助入口导出来，方便后续：
+
+- 单独写验证脚本
+- 在 `zoomnext_jt.py` 里接入 backbone
+
+### 12.4 `scripts/validate_jittor_resnet50_backbone.py` 完整代码
+
+```python
+#!/usr/bin/env python3
+"""Validate the migrated Jittor ResNet50 backbone against the PyTorch reference."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import random
+import sys
+from typing import Dict, List
+
+import numpy as np
+import timm
+import torch
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate Jittor ResNet50 backbone against PyTorch/timm.")
+    parser.add_argument("--seed", type=int, default=20260414)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--height", type=int, default=352)
+    parser.add_argument("--width", type=int, default=352)
+    parser.add_argument(
+        "--weight-path",
+        type=pathlib.Path,
+        default=REPO_ROOT / "pretrained_weights" / "resnet50-timm.pth",
+    )
+    parser.add_argument("--tol-max", type=float, default=1e-5)
+    parser.add_argument("--tol-mean", type=float, default=1e-6)
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def compare_feature(name: str, pt_value: torch.Tensor, jt_value: np.ndarray) -> Dict[str, object]:
+    pt_arr = pt_value.detach().cpu().numpy().astype(np.float32)
+    jt_arr = np.asarray(jt_value, dtype=np.float32)
+    abs_err = np.abs(pt_arr - jt_arr)
+    return {
+        "name": name,
+        "shape": list(pt_arr.shape),
+        "max_abs_err": float(abs_err.max()),
+        "mean_abs_err": float(abs_err.mean()),
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    set_seed(args.seed)
+
+    if not args.weight_path.is_file():
+        raise SystemExit(f"Cannot find pretrained weights: {args.weight_path}")
+
+    try:
+        import jittor as jt
+    except ImportError as exc:
+        raise SystemExit(
+            "Jittor is not installed. Please install Jittor in the container before running this script."
+        ) from exc
+
+    from jittor_impl.models.backbone import build_resnet50
+
+    jt.flags.use_cuda = 0
+
+    x_np = np.random.randn(args.batch_size, 3, args.height, args.width).astype(np.float32)
+    x_pt = torch.from_numpy(x_np)
+    x_jt = jt.array(x_np)
+
+    pt_model = timm.create_model("resnet50", features_only=True, out_indices=range(5), pretrained=False)
+    pt_state = torch.load(args.weight_path, map_location="cpu")
+    pt_model.load_state_dict(pt_state, strict=False)
+    pt_model.eval()
+
+    jt_model = build_resnet50(pretrained=True, weight_path=str(args.weight_path))
+    jt_model.eval()
+
+    with torch.no_grad():
+        pt_outputs = pt_model(x_pt)
+    jt_outputs = jt_model(x_jt)
+
+    reports: List[Dict[str, object]] = []
+    max_err = 0.0
+    mean_err = 0.0
+    for idx, (pt_value, jt_value) in enumerate(zip(pt_outputs, jt_outputs), start=1):
+        report = compare_feature(f"c{idx}", pt_value, jt_value.numpy())
+        reports.append(report)
+        max_err = max(max_err, report["max_abs_err"])
+        mean_err = max(mean_err, report["mean_abs_err"])
+
+    print(json.dumps(reports, indent=2, ensure_ascii=False))
+
+    if max_err > args.tol_max or mean_err > args.tol_mean:
+        print(f"\nValidation failed: max_abs_err={max_err:.6e}, max_mean_abs_err={mean_err:.6e}")
+        return 1
+
+    print("\nValidation passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+#### 这个脚本验证什么
+
+这个脚本不验证整网，只验证 backbone 的五级输出是否与 PyTorch/timm 对齐。
+
+它做的事情是：
+
+1. 读取同一个 `resnet50-timm.pth`
+2. 初始化 PyTorch 参考 backbone：`timm.create_model(..., features_only=True)`
+3. 初始化 Jittor 版 `ResNet50Backbone`
+4. 输入同一份随机张量
+5. 逐级对比 `c1` 到 `c5` 的最大绝对误差和平均绝对误差
+
+这样做的好处是：
+
+- 一旦这里通过，后面整网拼接时就可以把 backbone 当成已验证模块
+- 如果这里不过，问题也会被局限在 backbone，而不会和 `SimpleASPP`、`MHSIU`、`RGPU` 混在一起
+
+### 12.5 本轮本地检查结果
+
+当前本地开发环境里没有安装 Jittor，所以这一轮只能先完成：
+
+- 代码迁移
+- 预训练权重键名核对
+- PyTorch 参考输出层级核对
+- Python 语法静态检查
+
+已经完成的静态确认包括：
+
+1. 本地 `pretrained_weights/resnet50-timm.pth` 的键名与标准 `torchvision/timm` 风格一致
+2. `features_only=True` 的 PyTorch 参考输出层级已确认是 `c1 ~ c5`
+3. 新增的 `resnet50_jt.py` 和 `validate_jittor_resnet50_backbone.py` 已通过本地 `py_compile`
+
+### 12.6 Ubuntu 容器中的验证命令
+
+请在 Ubuntu 容器的仓库根目录执行：
+
+```bash
+python3 scripts/validate_jittor_resnet50_backbone.py
+```
+
+如果需要显式指定权重路径，可以执行：
+
+```bash
+python3 scripts/validate_jittor_resnet50_backbone.py --weight-path pretrained_weights/resnet50-timm.pth
+```
+
+### 12.7 当前阶段状态更新
+
+当前已经完成并通过验证的模块：
+
+- `SimpleASPP`
+- `MHSIU`
+- `DifferenceAwareOps`
+- `RGPU`
+
+当前已经完成代码迁移、但还等待容器回填验证结果的模块：
+
+- `ResNet50 backbone`
+
+下一步如果 backbone 验证通过，就进入：
+
+1. 在 `zoomnext_jt.py` 中接入 `ResNet50Backbone`
+2. 补齐 `RN50_ZoomNeXt_JT` 的整体前向
+3. 针对整网做分阶段验证
