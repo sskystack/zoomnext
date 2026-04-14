@@ -818,3 +818,316 @@ Jittor 版以下基础算子和 PyTorch 版数值非常接近：
 4. 增加 backbone 权重加载与逐层对比
 5. 增加整网 forward 对比
 6. 最后再进入 loss 与训练链路
+
+## 8. 第二轮更新：迁移 `SimpleASPP`
+
+这一轮开始正式迁移 `methods/zoomnext/layers.py` 里的第一个核心模块：`SimpleASPP`。
+
+本轮目标：
+
+- 把 `SimpleASPP` 从 PyTorch 等价迁移到 Jittor
+- 提供单模块验证脚本
+- 暂时不改动 `MHSIU`、`DifferenceAwareOps`、`RGPU`
+
+### 8.1 本轮修改的文件
+
+- 修改 `jittor_impl/models/layers_jt.py`
+- 新增 `scripts/validate_jittor_simple_aspp.py`
+
+### 8.2 `jittor_impl/models/layers_jt.py` 最新完整代码
+
+```python
+"""Jittor counterparts for the common ZoomNeXt layers.
+
+This file is migrated progressively. Each layer is ported one by one and
+validated against the PyTorch reference before the next layer lands.
+"""
+
+from __future__ import annotations
+
+import jittor as jt
+from jittor import nn
+
+from .ops_jt import ConvBNReLU, resize_to
+
+
+class SimpleASPP(nn.Module):
+    def __init__(self, in_dim, out_dim, dilation=3):
+        super().__init__()
+        self.out_dim = out_dim
+        self.conv1x1_1 = ConvBNReLU(in_dim, 2 * out_dim, 1)
+        self.conv1x1_2 = ConvBNReLU(out_dim, out_dim, 1)
+        self.conv3x3_1 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.conv3x3_2 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.conv3x3_3 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.fuse = nn.Sequential(
+            ConvBNReLU(5 * out_dim, out_dim, 1),
+            ConvBNReLU(out_dim, out_dim, 3, 1, 1),
+        )
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        y = self.conv1x1_1(x)
+        y1 = y[:, : self.out_dim, :, :]
+        y5 = y[:, self.out_dim :, :, :]
+
+        y2 = self.conv3x3_1(y1)
+        y3 = self.conv3x3_2(y2)
+        y4 = self.conv3x3_3(y3)
+
+        y0 = y5.mean(dims=(2, 3), keepdims=True)
+        y0 = self.conv1x1_2(y0)
+        y0 = resize_to(y0, tgt_hw=x.shape[-2:])
+        return self.fuse(jt.concat([y0, y1, y2, y3, y4], dim=1))
+
+
+class DifferenceAwareOps(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.args = args
+        self.kwargs = kwargs
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        raise NotImplementedError("DifferenceAwareOps will be migrated in the next step.")
+
+
+class RGPU(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.args = args
+        self.kwargs = kwargs
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        raise NotImplementedError("RGPU will be migrated in the next step.")
+
+
+class MHSIU(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.args = args
+        self.kwargs = kwargs
+
+    def execute(self, l: jt.Var, m: jt.Var, s: jt.Var) -> jt.Var:
+        del l, m, s
+        raise NotImplementedError("MHSIU will be migrated in the next step.")
+```
+
+解释：
+
+#### `SimpleASPP` 的迁移原则
+
+这里采用的是“结构逐项对应”的方式，而不是只保证输入输出维度一致。
+
+它和原仓库保持了同样的结构：
+
+- 一层 `1x1` 卷积把通道变成 `2 * out_dim`
+- 再把输出按通道一分为二，得到 `y1` 和 `y5`
+- `y1` 走 3 个串联的空洞卷积分支
+- `y5` 走全局平均池化分支
+- 最后把 `y0, y1, y2, y3, y4` 拼接后再做两层融合卷积
+
+#### 为什么这里不用 `chunk`
+
+PyTorch 原实现是：
+
+```python
+y1, y5 = y.chunk(2, dim=1)
+```
+
+Jittor 这里先使用切片：
+
+```python
+y1 = y[:, : self.out_dim, :, :]
+y5 = y[:, self.out_dim :, :, :]
+```
+
+原因是切片写法更直接，也更容易控制通道分割行为。  
+因为 `conv1x1_1` 明确输出 `2 * out_dim`，所以这里切成前后两半与原始 `chunk(2, dim=1)` 是等价的。
+
+#### 全局分支为什么这样写
+
+原仓库是：
+
+```python
+y0 = torch.mean(y5, dim=(2, 3), keepdim=True)
+```
+
+Jittor 中对应为：
+
+```python
+y0 = y5.mean(dims=(2, 3), keepdims=True)
+```
+
+保留了：
+
+- 沿 `H, W` 做平均
+- 保留空间维
+
+这样后续 `conv1x1_2` 和上采样才能与原仓库保持一致。
+
+#### 特别要注意的点
+
+这个模块对齐的关键不是“看起来结构像”，而是下面这些行为完全一致：
+
+- 卷积顺序
+- dilation 与 padding
+- 全局平均池化维度
+- 上采样接口 `resize_to`
+- 通道拼接顺序
+
+只要其中任何一个顺序不一样，最后输出都会漂。
+
+### 8.3 `scripts/validate_jittor_simple_aspp.py` 完整代码
+
+```python
+#!/usr/bin/env python3
+"""Validate the migrated Jittor SimpleASPP against the PyTorch reference."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import random
+import sys
+
+import numpy as np
+import torch
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from methods.zoomnext.layers import SimpleASPP as TorchSimpleASPP
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate Jittor SimpleASPP against PyTorch.")
+    parser.add_argument("--seed", type=int, default=20260414)
+    parser.add_argument("--in-dim", type=int, default=16)
+    parser.add_argument("--out-dim", type=int, default=8)
+    parser.add_argument("--height", type=int, default=11)
+    parser.add_argument("--width", type=int, default=13)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--tol-max", type=float, default=1e-5)
+    parser.add_argument("--tol-mean", type=float, default=1e-6)
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def compare_arrays(name: str, pt_value: torch.Tensor, jt_value: np.ndarray) -> dict:
+    pt_arr = pt_value.detach().cpu().numpy().astype(np.float32)
+    jt_arr = np.asarray(jt_value, dtype=np.float32)
+    abs_err = np.abs(pt_arr - jt_arr)
+    return {
+        "name": name,
+        "shape": list(pt_arr.shape),
+        "max_abs_err": float(abs_err.max()),
+        "mean_abs_err": float(abs_err.mean()),
+    }
+
+
+def torch_state_dict_to_numpy(state_dict: dict) -> dict:
+    return {name: value.detach().cpu().numpy() for name, value in state_dict.items()}
+
+
+def main() -> int:
+    args = parse_args()
+    set_seed(args.seed)
+
+    try:
+        import jittor as jt
+    except ImportError as exc:
+        raise SystemExit(
+            "Jittor is not installed. Please install Jittor in the container before running this script."
+        ) from exc
+
+    from jittor_impl.models.layers_jt import SimpleASPP as JittorSimpleASPP
+
+    jt.flags.use_cuda = 0
+
+    x_np = np.random.randn(args.batch_size, args.in_dim, args.height, args.width).astype(np.float32)
+    x_pt = torch.from_numpy(x_np)
+    x_jt = jt.array(x_np)
+
+    pt_model = TorchSimpleASPP(args.in_dim, args.out_dim)
+    pt_model.eval()
+
+    jt_model = JittorSimpleASPP(args.in_dim, args.out_dim)
+    jt_model.eval()
+    jt_model.load_state_dict(torch_state_dict_to_numpy(pt_model.state_dict()))
+
+    with torch.no_grad():
+        pt_output = pt_model(x_pt)
+    jt_output = jt_model(x_jt).numpy()
+
+    report = compare_arrays("SimpleASPP", pt_output, jt_output)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    if report["max_abs_err"] > args.tol_max or report["mean_abs_err"] > args.tol_mean:
+        print(
+            "\nValidation failed: "
+            f"max_abs_err={report['max_abs_err']:.6e}, mean_abs_err={report['mean_abs_err']:.6e}"
+        )
+        return 1
+
+    print("\nValidation passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+解释：
+
+这个脚本的用途是把 `SimpleASPP` 单独拿出来做“同权重、同输入、同模式”的对比。
+
+它做的事情是：
+
+1. 固定随机种子
+2. 构造同一份输入张量
+3. 初始化 PyTorch 版 `SimpleASPP`
+4. 用 PyTorch 权重初始化 Jittor 版 `SimpleASPP`
+5. 两边都切到 `eval` 模式，避免 BN 使用当前 batch 统计导致不一致
+6. 输出最大误差和平均误差
+
+为什么一定要 `eval()`：
+
+因为 `SimpleASPP` 里面每一层 `ConvBNReLU` 都带 BN。  
+如果 PyTorch 用 `eval()`，而 Jittor 还在训练模式，那么两边就会因为 BN 统计来源不同而出现额外误差，这会污染迁移结论。
+
+### 8.4 本轮验证命令
+
+这一轮的 Ubuntu 容器验证命令如下：
+
+```bash
+python3 scripts/validate_jittor_simple_aspp.py
+```
+
+如果容器里不是从仓库根目录执行，也可以显式写成：
+
+```bash
+PYTHONPATH=. python3 scripts/validate_jittor_simple_aspp.py
+```
+
+### 8.5 当前阶段结论更新
+
+当前进度更新为：
+
+- 基础算子层已完成并验证通过
+- `SimpleASPP` 已完成代码迁移
+- `SimpleASPP` 验证脚本已新增
+- 但 `SimpleASPP` 的数值结果还需要容器实际运行后回填到报告中
+
+仍未完成的模块：
+
+- `MHSIU`
+- `DifferenceAwareOps`
+- `RGPU`
+- `ResNet50 backbone`
+- `RN50_ZoomNeXt` 整体前向
