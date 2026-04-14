@@ -1131,3 +1131,158 @@ PYTHONPATH=. python3 scripts/validate_jittor_simple_aspp.py
 - `RGPU`
 - `ResNet50 backbone`
 - `RN50_ZoomNeXt` 整体前向
+
+### 8.6 第一轮 `SimpleASPP` 验证结果与问题定位
+
+你在 Ubuntu 容器中执行了：
+
+```bash
+python3 scripts/validate_jittor_simple_aspp.py
+```
+
+得到的关键信息是：
+
+```text
+[w ...] load parameter conv1x1_1.conv.weight failed ...
+[w ...] load parameter conv1x1_1.bn.weight failed ...
+...
+[w ...] load total 42 params, 35 failed
+```
+
+以及数值结果：
+
+```json
+{
+  "name": "SimpleASPP",
+  "shape": [2, 8, 11, 13],
+  "max_abs_err": 0.2009652853012085,
+  "mean_abs_err": 0.0260984655469656
+}
+```
+
+最终结论：
+
+```text
+Validation failed: max_abs_err=2.009653e-01, mean_abs_err=2.609847e-02
+```
+
+这说明当前失败的直接原因不是 `SimpleASPP` 的拓扑结构先天错误，而是：
+
+- PyTorch 权重没有正确加载到 Jittor 模型中
+- 两边实际上不是“同权重、同输入”的对比
+- 因此当前误差不能直接用来判断 `SimpleASPP` 的迁移逻辑是否正确
+
+### 8.7 针对本次失败的修复
+
+问题根因分析：
+
+PyTorch 原仓库里的 `ConvBNReLU` 是这样组织子模块命名的：
+
+- `conv`
+- `bn`
+- `relu` 或其他激活名
+
+而我最开始在 Jittor 版 `ops_jt.py` 里使用的是 `Sequential.append(...)`，这通常会生成按顺序编号的子模块名，而不是原仓库需要的：
+
+- `conv`
+- `bn`
+- `relu`
+
+这会导致 `state_dict` 键名不一致，典型表现就是：
+
+```text
+load parameter conv1x1_1.conv.weight failed ...
+```
+
+因为 Jittor 模型里实际对应参数名不是 `conv1x1_1.conv.weight`。
+
+本次修复内容如下：
+
+```python
+class ConvBNReLU(nn.Sequential):
+    def __init__(
+        self,
+        in_planes,
+        out_planes,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias=False,
+        act_name="relu",
+        is_transposed=False,
+    ):
+        super().__init__()
+        conv_cls = nn.ConvTranspose if is_transposed else nn.Conv2d
+        self.add_module(
+            "conv",
+            conv_cls(
+                in_planes,
+                out_planes,
+                kernel_size=kernel_size,
+                stride=_to_2tuple(stride),
+                padding=_to_2tuple(padding),
+                dilation=_to_2tuple(dilation),
+                groups=groups,
+                bias=bias,
+            ),
+        )
+        self.add_module("bn", nn.BatchNorm2d(out_planes))
+        if act_name is not None:
+            self.add_module(act_name, _get_act_fn(act_name=act_name))
+
+
+class ConvGNReLU(nn.Sequential):
+    def __init__(
+        self,
+        in_planes,
+        out_planes,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        gn_groups=8,
+        bias=False,
+        act_name="relu",
+        inplace=True,
+    ):
+        super().__init__()
+        self.add_module(
+            "conv",
+            nn.Conv2d(
+                in_planes,
+                out_planes,
+                kernel_size=kernel_size,
+                stride=_to_2tuple(stride),
+                padding=_to_2tuple(padding),
+                dilation=_to_2tuple(dilation),
+                groups=groups,
+                bias=bias,
+            ),
+        )
+        self.add_module("gn", nn.GroupNorm(num_groups=gn_groups, num_channels=out_planes))
+        if act_name is not None:
+            self.add_module(act_name, _get_act_fn(act_name=act_name, inplace=inplace))
+```
+
+这次修复的意义：
+
+- 让 Jittor 版 `ConvBNReLU/ConvGNReLU` 的参数命名与原 PyTorch 版一致
+- 让后续 `SimpleASPP`、`MHSIU`、`RGPU` 这类复合层可以直接用 `state_dict` 对齐权重
+- 为后续整个 `RN50_ZoomNeXt` 的权重映射打基础
+
+### 8.8 修复后的下一次验证命令
+
+修复后需要重新验证：
+
+```bash
+python3 scripts/validate_jittor_simple_aspp.py
+```
+
+新的验证结果回传后，需要重点观察：
+
+- 是否还出现大规模 `load parameter ... failed`
+- `max_abs_err` 是否下降到 `1e-5` 左右量级
+- `mean_abs_err` 是否下降到 `1e-6` 左右量级

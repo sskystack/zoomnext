@@ -115,7 +115,8 @@ class ConvBNReLU(nn.Sequential):
     ):
         super().__init__()
         conv_cls = nn.ConvTranspose if is_transposed else nn.Conv2d
-        self.append(
+        self.add_module(
+            "conv",
             conv_cls(
                 in_planes,
                 out_planes,
@@ -125,11 +126,11 @@ class ConvBNReLU(nn.Sequential):
                 dilation=_to_2tuple(dilation),
                 groups=groups,
                 bias=bias,
-            )
+            ),
         )
-        self.append(nn.BatchNorm2d(out_planes))
+        self.add_module("bn", nn.BatchNorm2d(out_planes))
         if act_name is not None:
-            self.append(_get_act_fn(act_name=act_name))
+            self.add_module(act_name, _get_act_fn(act_name=act_name))
 
 
 class ConvGNReLU(nn.Sequential):
@@ -148,7 +149,8 @@ class ConvGNReLU(nn.Sequential):
         inplace=True,
     ):
         super().__init__()
-        self.append(
+        self.add_module(
+            "conv",
             nn.Conv2d(
                 in_planes,
                 out_planes,
@@ -158,11 +160,11 @@ class ConvGNReLU(nn.Sequential):
                 dilation=_to_2tuple(dilation),
                 groups=groups,
                 bias=bias,
-            )
+            ),
         )
-        self.append(nn.GroupNorm(num_groups=gn_groups, num_channels=out_planes))
+        self.add_module("gn", nn.GroupNorm(num_groups=gn_groups, num_channels=out_planes))
         if act_name is not None:
-            self.append(_get_act_fn(act_name=act_name, inplace=inplace))
+            self.add_module(act_name, _get_act_fn(act_name=act_name, inplace=inplace))
 
 
 class PixelNormalizer(nn.Module):
