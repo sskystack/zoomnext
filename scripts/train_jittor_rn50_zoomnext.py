@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import yaml
 from mmengine import Config
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -271,11 +272,14 @@ def main() -> int:
     curr_iter = 0
 
     start_time = time.perf_counter()
+    progress = tqdm(total=total_iters, desc="[JT-TRAIN]", ncols=100)
     for epoch in range(num_epochs):
         model.train()
         maybe_freeze_bn_stats(model, cfg.train.bn.freeze_status, cfg.train.bn.freeze_affine)
 
         for batch_ids in batch_indices(len(dataset), batch_size, seed=args.seed + epoch, drop_last=True):
+            progress.set_description(f"[JT-TRAIN][E{epoch}]")
+            progress.set_postfix_str(f"iter={curr_iter}")
             samples = [dataset[idx] for idx in batch_ids]
             np_batch = collate_samples(samples)
             jt_batch = {key: jt.array(value) for key, value in np_batch.items()}
@@ -294,18 +298,21 @@ def main() -> int:
                 "loss_str": outputs["loss_str"],
                 "shape": list(np_batch["mask"].shape),
             }
-            print(json.dumps(item, ensure_ascii=False))
+            progress.update(1)
+            progress.set_postfix_str(f"iter={curr_iter} loss={item['loss']:.5f} lr={item['lr_string']}")
+            progress.write(json.dumps(item, ensure_ascii=False))
 
             curr_iter += 1
             if curr_iter % args.save_every == 0 or curr_iter == total_iters:
                 save_path = save_checkpoint(jt, model, checkpoint_dir, curr_iter)
-                print(json.dumps({"checkpoint": str(save_path)}, ensure_ascii=False))
+                progress.write(json.dumps({"checkpoint": str(save_path)}, ensure_ascii=False))
 
             if curr_iter >= total_iters:
                 break
         if curr_iter >= total_iters:
             break
 
+    progress.close()
     final_path = save_checkpoint(jt, model, checkpoint_dir, curr_iter)
     elapsed = time.perf_counter() - start_time
     print(json.dumps({"final_checkpoint": str(final_path), "elapsed_sec": elapsed}, ensure_ascii=False))

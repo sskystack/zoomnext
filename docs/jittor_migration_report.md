@@ -5803,6 +5803,45 @@ forward_ algorithm cache is full
 - 是否能跑满 `2` 个 iter
 - 是否能保存 checkpoint
 
+### 14.18 为训练入口补充进度条
+
+在最小训练 smoke test 中，用户反馈“看不到进度输出，不容易判断是没进度还是还没打印到那一步”。
+
+为此，对 `scripts/train_jittor_rn50_zoomnext.py` 增加了 `tqdm` 进度条，核心改动如下：
+
+```python
+from tqdm import tqdm
+...
+progress = tqdm(total=total_iters, desc="[JT-TRAIN]", ncols=100)
+...
+progress.set_description(f"[JT-TRAIN][E{epoch}]")
+progress.set_postfix_str(f"iter={curr_iter}")
+...
+progress.update(1)
+progress.set_postfix_str(f"iter={curr_iter} loss={item['loss']:.5f} lr={item['lr_string']}")
+progress.write(json.dumps(item, ensure_ascii=False))
+...
+progress.write(json.dumps({"checkpoint": str(save_path)}, ensure_ascii=False))
+...
+progress.close()
+```
+
+#### 这个修改带来的效果
+
+现在训练脚本会同时提供两类可见反馈：
+
+1. `tqdm` 进度条  
+   直接显示当前 epoch、iter、loss、lr 和总体进度。
+
+2. 结构化日志  
+   继续保留每个 iter 的 JSON 输出，以及 checkpoint 保存日志。
+
+这样即使第一次 step 因为 Jittor 编译和 CUDA 初始化比较慢，也能更清楚地区分：
+
+- 程序是否仍在推进
+- 当前大致卡在第几个 iter
+- 是否已经真正完成参数更新
+
 ### 14.17 最小训练中的 `doesn't have gradient` 警告说明
 
 用户继续观察到如下警告：
