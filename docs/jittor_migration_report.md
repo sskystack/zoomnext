@@ -4050,3 +4050,488 @@ Validation passed.
 1. 在 `zoomnext_jt.py` 中接入 `ResNet50Backbone`
 2. 把 `tra_5 ~ tra_1`、`siu_5 ~ siu_1`、`hmu_5 ~ hmu_1`、`predictor` 串成完整前向
 3. 新增整网验证脚本，先验证单尺度 backbone+neck+head 前向，再验证完整 `body`
+
+## 13. 第七轮更新：迁移 `RN50_ZoomNeXt_JT` 整体前向
+
+这一轮开始把已经分别验证通过的模块真正拼成完整模型：
+
+- `ResNet50Backbone`
+- `SimpleASPP`
+- `MHSIU`
+- `RGPU`
+- `predictor`
+
+目标是得到与 PyTorch 版 `RN50_ZoomNeXt` 对应的 Jittor 整网实现，并补上独立的整网对照验证脚本。
+
+### 13.1 本轮修改的文件
+
+- `jittor_impl/models/zoomnext_jt.py`
+- `jittor_impl/models/__init__.py`
+- `scripts/validate_jittor_rn50_zoomnext.py`
+
+### 13.2 `jittor_impl/models/zoomnext_jt.py` 最新完整代码
+
+```python
+"""Jittor implementation of the ResNet50-based ZoomNeXt model."""
+
+from __future__ import annotations
+
+import abc
+import logging
+import math
+from typing import Dict
+
+import jittor as jt
+from jittor import nn
+
+from .backbone import build_resnet50
+from .layers_jt import MHSIU, RGPU, SimpleASPP
+from .ops_jt import ConvBNReLU, PixelNormalizer, resize_to
+
+LOGGER = logging.getLogger("main")
+
+
+class _Identity(nn.Module):
+    def execute(self, x: jt.Var) -> jt.Var:
+        return x
+
+
+class _BilinearUpsample(nn.Module):
+    def __init__(self, scale_factor: int = 2):
+        super().__init__()
+        self.scale_factor = scale_factor
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        return nn.interpolate(x, scale_factor=self.scale_factor, mode="bilinear", align_corners=False)
+
+
+def _scalar(var: jt.Var) -> float:
+    return float(var.numpy().reshape(-1)[0])
+
+
+class _ZoomNeXt_Base(nn.Module):
+    @staticmethod
+    def get_coef(iter_percentage=1, method="cos", milestones=(0, 1)):
+        min_point, max_point = min(milestones), max(milestones)
+        min_coef, max_coef = 0, 1
+
+        ual_coef = 1.0
+        if iter_percentage < min_point:
+            ual_coef = min_coef
+        elif iter_percentage > max_point:
+            ual_coef = max_coef
+        else:
+            if method == "linear":
+                ratio = (max_coef - min_coef) / (max_point - min_point)
+                ual_coef = ratio * (iter_percentage - min_point)
+            elif method == "cos":
+                perc = (iter_percentage - min_point) / (max_point - min_point)
+                normalized_coef = (1 - math.cos(perc * math.pi)) / 2
+                ual_coef = normalized_coef * (max_coef - min_coef) + min_coef
+        return ual_coef
+
+    @abc.abstractmethod
+    def body(self, data: Dict[str, jt.Var]) -> jt.Var:
+        raise NotImplementedError
+
+    def execute(self, data, iter_percentage=1, **kwargs):
+        del kwargs
+        logits = self.body(data=data)
+
+        if self.is_training():
+            mask = data["mask"]
+            prob = jt.sigmoid(logits)
+
+            losses = []
+            loss_str = []
+
+            sod_loss = nn.BCEWithLogitsLoss()(logits, mask)
+            losses.append(sod_loss)
+            loss_str.append(f"bce: {_scalar(sod_loss):.5f}")
+
+            ual_coef = self.get_coef(iter_percentage=iter_percentage, method="cos", milestones=(0, 1))
+            ual_loss = ual_coef * (1 - jt.abs(2 * prob - 1).pow(2)).mean()
+            losses.append(ual_loss)
+            loss_str.append(f"powual_{ual_coef:.5f}: {_scalar(ual_loss):.5f}")
+            return dict(vis=dict(sal=prob), loss=sum(losses), loss_str=" ".join(loss_str))
+        return logits
+
+    def get_grouped_params(self):
+        param_groups = {"pretrained": [], "fixed": [], "retrained": []}
+        for name, param in self.named_parameters():
+            if name.startswith("encoder.patch_embed1."):
+                param.requires_grad = False
+                param_groups["fixed"].append(param)
+            elif name.startswith("encoder."):
+                param_groups["pretrained"].append(param)
+            else:
+                if "clip." in name:
+                    param.requires_grad = False
+                    param_groups["fixed"].append(param)
+                else:
+                    param_groups["retrained"].append(param)
+        LOGGER.info(
+            f"Parameter Groups:{{"
+            f"Pretrained: {len(param_groups['pretrained'])}, "
+            f"Fixed: {len(param_groups['fixed'])}, "
+            f"ReTrained: {len(param_groups['retrained'])}}}"
+        )
+        return param_groups
+
+
+class RN50_ZoomNeXt_JT(_ZoomNeXt_Base):
+    def __init__(
+        self,
+        pretrained=True,
+        num_frames=1,
+        input_norm=True,
+        mid_dim=64,
+        siu_groups=4,
+        hmu_groups=6,
+        weight_path: str | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        del kwargs
+
+        self.encoder = build_resnet50(pretrained=pretrained, weight_path=weight_path)
+
+        self.tra_5 = SimpleASPP(in_dim=2048, out_dim=mid_dim)
+        self.siu_5 = MHSIU(mid_dim, siu_groups)
+        self.hmu_5 = RGPU(mid_dim, hmu_groups, num_frames=num_frames)
+
+        self.tra_4 = ConvBNReLU(1024, mid_dim, 3, 1, 1)
+        self.siu_4 = MHSIU(mid_dim, siu_groups)
+        self.hmu_4 = RGPU(mid_dim, hmu_groups, num_frames=num_frames)
+
+        self.tra_3 = ConvBNReLU(512, mid_dim, 3, 1, 1)
+        self.siu_3 = MHSIU(mid_dim, siu_groups)
+        self.hmu_3 = RGPU(mid_dim, hmu_groups, num_frames=num_frames)
+
+        self.tra_2 = ConvBNReLU(256, mid_dim, 3, 1, 1)
+        self.siu_2 = MHSIU(mid_dim, siu_groups)
+        self.hmu_2 = RGPU(mid_dim, hmu_groups, num_frames=num_frames)
+
+        self.tra_1 = ConvBNReLU(64, mid_dim, 3, 1, 1)
+        self.siu_1 = MHSIU(mid_dim, siu_groups)
+        self.hmu_1 = RGPU(mid_dim, hmu_groups, num_frames=num_frames)
+
+        self.normalizer = PixelNormalizer() if input_norm else _Identity()
+        self.predictor = nn.Sequential()
+        self.predictor.add_module("0", _BilinearUpsample(scale_factor=2))
+        self.predictor.add_module("1", ConvBNReLU(64, 32, 3, 1, 1))
+        self.predictor.add_module("2", nn.Conv2d(32, 1, 1))
+
+    def normalize_encoder(self, x: jt.Var):
+        x = self.normalizer(x)
+        c1, c2, c3, c4, c5 = self.encoder(x)
+        return c1, c2, c3, c4, c5
+
+    def body(self, data: Dict[str, jt.Var]) -> jt.Var:
+        l_trans_feats = self.normalize_encoder(data["image_l"])
+        m_trans_feats = self.normalize_encoder(data["image_m"])
+        s_trans_feats = self.normalize_encoder(data["image_s"])
+
+        l, m, s = (
+            self.tra_5(l_trans_feats[4]),
+            self.tra_5(m_trans_feats[4]),
+            self.tra_5(s_trans_feats[4]),
+        )
+        lms = self.siu_5(l=l, m=m, s=s)
+        x = self.hmu_5(lms)
+
+        l, m, s = (
+            self.tra_4(l_trans_feats[3]),
+            self.tra_4(m_trans_feats[3]),
+            self.tra_4(s_trans_feats[3]),
+        )
+        lms = self.siu_4(l=l, m=m, s=s)
+        x = self.hmu_4(lms + resize_to(x, tgt_hw=lms.shape[-2:]))
+
+        l, m, s = (
+            self.tra_3(l_trans_feats[2]),
+            self.tra_3(m_trans_feats[2]),
+            self.tra_3(s_trans_feats[2]),
+        )
+        lms = self.siu_3(l=l, m=m, s=s)
+        x = self.hmu_3(lms + resize_to(x, tgt_hw=lms.shape[-2:]))
+
+        l, m, s = (
+            self.tra_2(l_trans_feats[1]),
+            self.tra_2(m_trans_feats[1]),
+            self.tra_2(s_trans_feats[1]),
+        )
+        lms = self.siu_2(l=l, m=m, s=s)
+        x = self.hmu_2(lms + resize_to(x, tgt_hw=lms.shape[-2:]))
+
+        l, m, s = (
+            self.tra_1(l_trans_feats[0]),
+            self.tra_1(m_trans_feats[0]),
+            self.tra_1(s_trans_feats[0]),
+        )
+        lms = self.siu_1(l=l, m=m, s=s)
+        x = self.hmu_1(lms + resize_to(x, tgt_hw=lms.shape[-2:]))
+
+        return self.predictor(x)
+```
+
+#### 这一版整网做了什么
+
+这一版不是重新设计模型，而是严格按 PyTorch 原实现把已经迁好的模块重新串起来：
+
+1. `normalize_encoder` 先做输入归一化，再提取 `c1 ~ c5`
+2. 从 `tra_5 + siu_5 + hmu_5` 开始自顶向下解码
+3. 每一级都把上一层输出 resize 到当前尺度后再相加
+4. 最后通过 `predictor` 输出单通道 logits
+
+也就是说，这一步的目标是“把前面已经验证过的模块按原顺序拼起来”，而不是在整网阶段再引入新的结构变化。
+
+#### 为什么保留 `_ZoomNeXt_Base`
+
+这里把 PyTorch 版里的基类也迁进来了，原因有两个：
+
+1. 推理时直接返回 logits 的逻辑需要一致
+2. 训练时 `BCEWithLogits + UAL loss` 的接口行为也要保持一致
+
+目前优先验证的是 `eval()` 分支，也就是纯前向输出是否和 PyTorch 对齐。  
+训练分支虽然已经一并写入，但是否需要再做单独 loss 对照，后面可以再补。
+
+### 13.3 `jittor_impl/models/__init__.py` 最新完整代码
+
+```python
+"""Model modules for the Jittor ZoomNeXt migration."""
+
+from .zoomnext_jt import RN50_ZoomNeXt_JT
+
+__all__ = ["RN50_ZoomNeXt_JT"]
+```
+
+这里的作用是把整网入口导出，方便验证脚本直接 `from jittor_impl.models import RN50_ZoomNeXt_JT`。
+
+### 13.4 `scripts/validate_jittor_rn50_zoomnext.py` 完整代码
+
+```python
+#!/usr/bin/env python3
+"""Validate the migrated Jittor RN50_ZoomNeXt model against the PyTorch reference."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import random
+import sys
+from typing import Dict
+
+import numpy as np
+import torch
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from methods.zoomnext.zoomnext import RN50_ZoomNeXt
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate Jittor RN50_ZoomNeXt against PyTorch.")
+    parser.add_argument("--seed", type=int, default=20260414)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-frames", type=int, default=1)
+    parser.add_argument("--mid-dim", type=int, default=64)
+    parser.add_argument("--siu-groups", type=int, default=4)
+    parser.add_argument("--hmu-groups", type=int, default=6)
+    parser.add_argument("--height-l", type=int, default=352)
+    parser.add_argument("--width-l", type=int, default=352)
+    parser.add_argument("--height-m", type=int, default=352)
+    parser.add_argument("--width-m", type=int, default=352)
+    parser.add_argument("--height-s", type=int, default=352)
+    parser.add_argument("--width-s", type=int, default=352)
+    parser.add_argument(
+        "--encoder-weight-path",
+        type=pathlib.Path,
+        default=REPO_ROOT / "pretrained_weights" / "resnet50-timm.pth",
+    )
+    parser.add_argument("--tol-max", type=float, default=3e-4)
+    parser.add_argument("--tol-mean", type=float, default=1e-6)
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def compare_arrays(name: str, pt_value: torch.Tensor, jt_value: np.ndarray) -> Dict[str, object]:
+    pt_arr = pt_value.detach().cpu().numpy().astype(np.float32)
+    jt_arr = np.asarray(jt_value, dtype=np.float32)
+    abs_err = np.abs(pt_arr - jt_arr)
+    return {
+        "name": name,
+        "shape": list(pt_arr.shape),
+        "max_abs_err": float(abs_err.max()),
+        "mean_abs_err": float(abs_err.mean()),
+    }
+
+
+def map_torch_state_dict_to_jittor(state_dict: dict) -> dict:
+    mapped = {}
+    for name, value in state_dict.items():
+        if name in {"normalizer.mean", "normalizer.std"}:
+            continue
+
+        mapped_name = name
+        mapped_name = mapped_name.replace("gate_genator.1.", "gate_conv1.")
+        mapped_name = mapped_name.replace("gate_genator.3.", "gate_conv2.")
+        mapped_name = mapped_name.replace("fuse.0.", "fuse_diff.")
+        mapped_name = mapped_name.replace("fuse.1.", "fuse_conv.")
+        for group_id in range(100):
+            prefix = f"interact.{group_id}."
+            if prefix in mapped_name:
+                mapped_name = mapped_name.replace(prefix, f"interact_{group_id}.")
+                break
+        mapped[mapped_name] = value.detach().cpu().numpy()
+    return mapped
+
+
+def main() -> int:
+    args = parse_args()
+    set_seed(args.seed)
+
+    try:
+        import jittor as jt
+    except ImportError as exc:
+        raise SystemExit(
+            "Jittor is not installed. Please install Jittor in the container before running this script."
+        ) from exc
+
+    from jittor_impl.models import RN50_ZoomNeXt_JT
+
+    jt.flags.use_cuda = 0
+
+    image_l = np.random.randn(args.batch_size, 3, args.height_l, args.width_l).astype(np.float32)
+    image_m = np.random.randn(args.batch_size, 3, args.height_m, args.width_m).astype(np.float32)
+    image_s = np.random.randn(args.batch_size, 3, args.height_s, args.width_s).astype(np.float32)
+
+    pt_inputs = {
+        "image_l": torch.from_numpy(image_l),
+        "image_m": torch.from_numpy(image_m),
+        "image_s": torch.from_numpy(image_s),
+    }
+    jt_inputs = {
+        "image_l": jt.array(image_l),
+        "image_m": jt.array(image_m),
+        "image_s": jt.array(image_s),
+    }
+
+    pt_model = RN50_ZoomNeXt(
+        pretrained=False,
+        num_frames=args.num_frames,
+        input_norm=True,
+        mid_dim=args.mid_dim,
+        siu_groups=args.siu_groups,
+        hmu_groups=args.hmu_groups,
+    )
+    if args.encoder_weight_path.is_file():
+        encoder_state = torch.load(args.encoder_weight_path, map_location="cpu")
+        pt_model.encoder.load_state_dict(encoder_state, strict=False)
+    pt_model.eval()
+
+    jt_model = RN50_ZoomNeXt_JT(
+        pretrained=False,
+        num_frames=args.num_frames,
+        input_norm=True,
+        mid_dim=args.mid_dim,
+        siu_groups=args.siu_groups,
+        hmu_groups=args.hmu_groups,
+    )
+    jt_model.eval()
+    jt_model.load_state_dict(map_torch_state_dict_to_jittor(pt_model.state_dict()))
+
+    with torch.no_grad():
+        pt_output = pt_model(pt_inputs)
+    jt_output = jt_model(jt_inputs).numpy()
+
+    report = compare_arrays("RN50_ZoomNeXt", pt_output, jt_output)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    if report["max_abs_err"] > args.tol_max or report["mean_abs_err"] > args.tol_mean:
+        print(
+            "\nValidation failed: "
+            f"max_abs_err={report['max_abs_err']:.6e}, mean_abs_err={report['mean_abs_err']:.6e}"
+        )
+        return 1
+
+    print("\nValidation passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+#### 这个脚本是怎么验证整网的
+
+这个脚本做的不是 backbone 验证，而是完整 `body` 前向验证。
+
+它的步骤是：
+
+1. 构造同一份 `image_l / image_m / image_s`
+2. 初始化 PyTorch 版 `RN50_ZoomNeXt`
+3. 给 PyTorch backbone 加载 `resnet50-timm.pth`
+4. 用 PyTorch 整网 `state_dict()` 初始化 Jittor 整网
+5. 对 Jittor 侧做整网键名映射
+6. 在 `eval()` 模式下对比最终 saliency logits
+
+#### 为什么整网还需要额外的键名映射
+
+虽然 backbone 的键名可以直接对齐，但整网里还存在前面已经处理过的几类 Jittor/PyTorch 命名差异：
+
+- `gate_genator` 拆成了显式模块
+- `fuse` 在 Jittor 里拆成了 `fuse_diff` 和 `fuse_conv`
+- `interact` 由 `ModuleDict` 形式改成了显式注册的 `interact_0`、`interact_1`...
+
+所以整网验证脚本仍然需要做一层统一映射，这样才能把 PyTorch 整网权重完整加载到 Jittor 整网中。
+
+### 13.5 当前阶段结论更新
+
+当前已经完成代码迁移的模块包括：
+
+- `SimpleASPP`
+- `MHSIU`
+- `DifferenceAwareOps`
+- `RGPU`
+- `ResNet50 backbone`
+- `RN50_ZoomNeXt_JT` 整体前向
+
+其中已经完成并验证通过的模块包括：
+
+- `SimpleASPP`
+- `MHSIU`
+- `DifferenceAwareOps`
+- `RGPU`
+- `ResNet50 backbone`
+
+当前还等待容器验证结果回填的部分只剩：
+
+- `RN50_ZoomNeXt_JT` 整体前向
+
+### 13.6 Ubuntu 容器中的验证命令
+
+请在 Ubuntu 容器仓库根目录执行：
+
+```bash
+python3 scripts/validate_jittor_rn50_zoomnext.py
+```
+
+如果需要显式指定 backbone 权重路径，可以执行：
+
+```bash
+python3 scripts/validate_jittor_rn50_zoomnext.py --encoder-weight-path pretrained_weights/resnet50-timm.pth
+```
+
+### 13.7 当前阶段说明
+
+这一步代码已经写完，并且本地通过了 Python 语法静态检查。  
+但由于当前本地开发环境没有安装 Jittor，也没有 `einops` 来直接运行 PyTorch 参考整网，所以整网数值对照结果需要以 Ubuntu 容器里的实际输出为准。
