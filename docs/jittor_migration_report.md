@@ -4670,3 +4670,708 @@ python3 scripts/validate_jittor_rn50_zoomnext.py
 
 1. 是否还存在 `tra_5.fuse_*` 相关的 `load failed`
 2. 整网 `max_abs_err` 与 `mean_abs_err` 是否明显下降
+
+### 13.11 修复后的第二次 `RN50_ZoomNeXt_JT` 验证结果
+
+用户在 Ubuntu 容器中重新执行：
+
+```bash
+python3 scripts/validate_jittor_rn50_zoomnext.py
+```
+
+得到的输出如下：
+
+```json
+{
+  "name": "RN50_ZoomNeXt",
+  "shape": [
+    2,
+    1,
+    352,
+    352
+  ],
+  "max_abs_err": 2.980232238769531e-07,
+  "mean_abs_err": 6.933318985602455e-08
+}
+
+Validation passed.
+```
+
+### 13.12 这次结果说明什么
+
+这次结果可以明确说明：
+
+1. 整网权重已经能够完整正确地从 PyTorch 映射到 Jittor
+2. `RN50_ZoomNeXt_JT` 的完整前向输出已经与原 PyTorch 版数值对齐
+3. 前面分别验证通过的 `ResNet50 backbone`、`SimpleASPP`、`MHSIU`、`RGPU` 在整网组合后仍保持一致
+
+并且这次误差非常小：
+
+- `max_abs_err = 2.980232238769531e-07`
+- `mean_abs_err = 6.933318985602455e-08`
+
+这已经明显低于前面 backbone 验证时允许的误差范围，也远低于整网脚本当前阈值。  
+因此这里不需要再调整阈值，也不需要再补额外的底层修复。
+
+也就是说，当前可以正式视为：
+
+> `RN50_ZoomNeXt_JT` 已完成等价迁移，并通过了 Ubuntu 容器中的 PyTorch/Jittor 整网级对照验证。
+
+### 13.13 当前阶段状态更新
+
+当前已经完成并验证通过的部分包括：
+
+- `SimpleASPP`
+- `MHSIU`
+- `DifferenceAwareOps`
+- `RGPU`
+- `ResNet50 backbone`
+- `RN50_ZoomNeXt_JT` 整体前向
+
+到这一阶段，当前约定范围内的 `resnet50` 迁移链路已经完整闭环：
+
+- backbone
+- neck / interaction modules
+- predictor
+- 整网前向
+- 模块级与整网级验证
+
+### 13.14 当前阶段结论
+
+在“只迁移 `resnet50` backbone 版本，不动其他 backbone”的当前目标下，Jittor 迁移已经完成并通过验证。
+
+后续如果继续推进，优先方向将变成：
+
+1. 训练分支 loss 行为验证
+2. `get_grouped_params` 等训练配套接口验证
+3. 非 `resnet50` backbone 的迁移
+
+## 14. 第八轮更新：补齐训练链路验证与训练入口
+
+在 `RN50_ZoomNeXt_JT` 的整网前向已经完成并验证通过之后，这一轮继续补两部分：
+
+1. 训练分支对照验证脚本
+2. 基于数据集配置的 Jittor 训练入口脚本
+
+这样当前 `resnet50` 迁移链路就不只停留在“能推理”，而是进一步覆盖：
+
+- `train()` 分支返回格式
+- `loss / loss_str / vis`
+- 参数分组
+- 基础训练 step 与 checkpoint 保存
+
+### 14.1 本轮新增文件
+
+- `scripts/validate_jittor_rn50_zoomnext_train.py`
+- `scripts/train_jittor_rn50_zoomnext.py`
+
+### 14.2 `scripts/validate_jittor_rn50_zoomnext_train.py` 完整代码
+
+```python
+#!/usr/bin/env python3
+"""Validate the Jittor RN50_ZoomNeXt training path against the PyTorch reference."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import random
+import sys
+from typing import Dict
+
+import numpy as np
+import torch
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from methods.zoomnext.zoomnext import RN50_ZoomNeXt
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate Jittor RN50_ZoomNeXt training path against PyTorch.")
+    parser.add_argument("--seed", type=int, default=20260414)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-frames", type=int, default=1)
+    parser.add_argument("--mid-dim", type=int, default=64)
+    parser.add_argument("--siu-groups", type=int, default=4)
+    parser.add_argument("--hmu-groups", type=int, default=6)
+    parser.add_argument("--height", type=int, default=352)
+    parser.add_argument("--width", type=int, default=352)
+    parser.add_argument("--iter-percentage", type=float, default=0.37)
+    parser.add_argument(
+        "--encoder-weight-path",
+        type=pathlib.Path,
+        default=REPO_ROOT / "pretrained_weights" / "resnet50-timm.pth",
+    )
+    parser.add_argument("--tol-sal-max", type=float, default=5e-4)
+    parser.add_argument("--tol-sal-mean", type=float, default=1e-6)
+    parser.add_argument("--tol-loss", type=float, default=1e-6)
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def compare_arrays(name: str, pt_value: torch.Tensor, jt_value: np.ndarray) -> Dict[str, object]:
+    pt_arr = pt_value.detach().cpu().numpy().astype(np.float32)
+    jt_arr = np.asarray(jt_value, dtype=np.float32)
+    abs_err = np.abs(pt_arr - jt_arr)
+    return {
+        "name": name,
+        "shape": list(pt_arr.shape),
+        "max_abs_err": float(abs_err.max()),
+        "mean_abs_err": float(abs_err.mean()),
+    }
+
+
+def parameter_count(params) -> int:
+    return sum(int(np.prod(tuple(param.shape))) for param in params)
+
+
+def summarize_groups(groups: dict) -> Dict[str, Dict[str, int]]:
+    return {
+        group_name: {
+            "params": len(group_params),
+            "elements": parameter_count(group_params),
+        }
+        for group_name, group_params in groups.items()
+    }
+
+
+def map_torch_state_dict_to_jittor(state_dict: dict) -> dict:
+    mapped = {}
+    for name, value in state_dict.items():
+        if name in {"normalizer.mean", "normalizer.std"}:
+            continue
+
+        mapped_name = name
+        if mapped_name.startswith("hmu_"):
+            mapped_name = mapped_name.replace("gate_genator.1.", "gate_conv1.")
+            mapped_name = mapped_name.replace("gate_genator.3.", "gate_conv2.")
+            mapped_name = mapped_name.replace("fuse.0.", "fuse_diff.")
+            mapped_name = mapped_name.replace("fuse.1.", "fuse_conv.")
+            for group_id in range(100):
+                prefix = f"interact.{group_id}."
+                if prefix in mapped_name:
+                    mapped_name = mapped_name.replace(prefix, f"interact_{group_id}.")
+                    break
+        mapped[mapped_name] = value.detach().cpu().numpy()
+    return mapped
+
+
+def main() -> int:
+    args = parse_args()
+    set_seed(args.seed)
+
+    try:
+        import jittor as jt
+    except ImportError as exc:
+        raise SystemExit(
+            "Jittor is not installed. Please install Jittor in the container before running this script."
+        ) from exc
+
+    from jittor_impl.models import RN50_ZoomNeXt_JT
+
+    jt.flags.use_cuda = 0
+
+    image_l = np.random.randn(args.batch_size, 3, args.height, args.width).astype(np.float32)
+    image_m = np.random.randn(args.batch_size, 3, args.height, args.width).astype(np.float32)
+    image_s = np.random.randn(args.batch_size, 3, args.height, args.width).astype(np.float32)
+    mask = np.random.rand(args.batch_size, 1, args.height, args.width).astype(np.float32)
+
+    pt_inputs = {
+        "image_l": torch.from_numpy(image_l),
+        "image_m": torch.from_numpy(image_m),
+        "image_s": torch.from_numpy(image_s),
+        "mask": torch.from_numpy(mask),
+    }
+    jt_inputs = {
+        "image_l": jt.array(image_l),
+        "image_m": jt.array(image_m),
+        "image_s": jt.array(image_s),
+        "mask": jt.array(mask),
+    }
+
+    pt_model = RN50_ZoomNeXt(
+        pretrained=False,
+        num_frames=args.num_frames,
+        input_norm=True,
+        mid_dim=args.mid_dim,
+        siu_groups=args.siu_groups,
+        hmu_groups=args.hmu_groups,
+    )
+    if args.encoder_weight_path.is_file():
+        encoder_state = torch.load(args.encoder_weight_path, map_location="cpu")
+        pt_model.encoder.load_state_dict(encoder_state, strict=False)
+    pt_model.train()
+
+    jt_model = RN50_ZoomNeXt_JT(
+        pretrained=False,
+        num_frames=args.num_frames,
+        input_norm=True,
+        mid_dim=args.mid_dim,
+        siu_groups=args.siu_groups,
+        hmu_groups=args.hmu_groups,
+    )
+    jt_model.train()
+    jt_model.load_state_dict(map_torch_state_dict_to_jittor(pt_model.state_dict()))
+
+    pt_groups = summarize_groups(pt_model.get_grouped_params())
+    jt_groups = summarize_groups(jt_model.get_grouped_params())
+
+    pt_output = pt_model(pt_inputs, iter_percentage=args.iter_percentage)
+    jt_output = jt_model(jt_inputs, iter_percentage=args.iter_percentage)
+
+    sal_report = compare_arrays("sal", pt_output["vis"]["sal"], jt_output["vis"]["sal"].numpy())
+    loss_abs_err = abs(float(pt_output["loss"].detach().cpu().item()) - float(jt_output["loss"].numpy()))
+    same_loss_str = pt_output["loss_str"] == jt_output["loss_str"]
+
+    report = {
+        "saliency": sal_report,
+        "loss_abs_err": loss_abs_err,
+        "loss_str_match": same_loss_str,
+        "pytorch_loss_str": pt_output["loss_str"],
+        "jittor_loss_str": jt_output["loss_str"],
+        "param_groups_match": pt_groups == jt_groups,
+        "pytorch_param_groups": pt_groups,
+        "jittor_param_groups": jt_groups,
+    }
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    if sal_report["max_abs_err"] > args.tol_sal_max or sal_report["mean_abs_err"] > args.tol_sal_mean:
+        print(
+            "\nValidation failed: "
+            f"sal_max_abs_err={sal_report['max_abs_err']:.6e}, sal_mean_abs_err={sal_report['mean_abs_err']:.6e}"
+        )
+        return 1
+    if loss_abs_err > args.tol_loss:
+        print(f"\nValidation failed: loss_abs_err={loss_abs_err:.6e}")
+        return 1
+    if not same_loss_str:
+        print("\nValidation failed: loss_str mismatch")
+        return 1
+    if pt_groups != jt_groups:
+        print("\nValidation failed: grouped params mismatch")
+        return 1
+
+    print("\nValidation passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+#### 这个训练对照脚本验证什么
+
+这不是整网推理对照，而是专门验证 `train()` 分支。
+
+它会同时比较：
+
+- `vis["sal"]`
+- `loss`
+- `loss_str`
+- `get_grouped_params()` 的分组统计
+
+也就是说，这个脚本验证的是“训练接口行为有没有和 PyTorch 对齐”，而不是单纯看前向 logits。
+
+### 14.3 `scripts/train_jittor_rn50_zoomnext.py` 完整代码
+
+```python
+#!/usr/bin/env python3
+"""Train the Jittor RN50_ZoomNeXt model with dataset configs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import time
+from pathlib import Path
+
+import albumentations as A
+import cv2
+import numpy as np
+import yaml
+from mmengine import Config
+
+from jittor_impl.models import RN50_ZoomNeXt_JT
+from utils import io, ops
+
+
+class ImageTrainDatasetJT:
+    def __init__(self, dataset_infos: dict, shape: dict):
+        self.shape = shape
+        self.total_data_paths = []
+        for dataset_name, dataset_info in dataset_infos.items():
+            image_path = os.path.join(dataset_info["root"], dataset_info["image"]["path"])
+            image_suffix = dataset_info["image"]["suffix"]
+            mask_path = os.path.join(dataset_info["root"], dataset_info["mask"]["path"])
+            mask_suffix = dataset_info["mask"]["suffix"]
+
+            image_names = [p[: -len(image_suffix)] for p in sorted(os.listdir(image_path)) if p.endswith(image_suffix)]
+            mask_names = [p[: -len(mask_suffix)] for p in sorted(os.listdir(mask_path)) if p.endswith(mask_suffix)]
+            valid_names = sorted(set(image_names).intersection(mask_names))
+            data_paths = [
+                (os.path.join(image_path, n) + image_suffix, os.path.join(mask_path, n) + mask_suffix)
+                for n in valid_names
+            ]
+            print(json.dumps({"dataset": dataset_name, "length": len(data_paths)}, ensure_ascii=False))
+            self.total_data_paths.extend(data_paths)
+
+        self.trains = A.Compose(
+            [
+                A.HorizontalFlip(p=0.5),
+                A.Rotate(limit=90, p=0.5, interpolation=cv2.INTER_LINEAR, border_mode=cv2.BORDER_REPLICATE),
+                A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.5),
+                A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=10, val_shift_limit=10, p=0.5),
+            ]
+        )
+
+    def __len__(self):
+        return len(self.total_data_paths)
+
+    def __getitem__(self, index):
+        image_path, mask_path = self.total_data_paths[index]
+        image = io.read_color_array(image_path)
+        mask = io.read_gray_array(mask_path, thr=0)
+        if image.shape[:2] != mask.shape:
+            h, w = mask.shape
+            image = ops.resize(image, height=h, width=w)
+
+        transformed = self.trains(image=image, mask=mask)
+        image = transformed["image"]
+        mask = transformed["mask"]
+
+        base_h = self.shape["h"]
+        base_w = self.shape["w"]
+        images = ops.ms_resize(image, scales=(0.5, 1.0, 1.5), base_h=base_h, base_w=base_w)
+
+        image_s = images[0].astype(np.float32) / 255.0
+        image_m = images[1].astype(np.float32) / 255.0
+        image_l = images[2].astype(np.float32) / 255.0
+        image_s = np.transpose(image_s, (2, 0, 1))
+        image_m = np.transpose(image_m, (2, 0, 1))
+        image_l = np.transpose(image_l, (2, 0, 1))
+
+        mask = ops.resize(mask, height=base_h, width=base_w).astype(np.float32)
+        mask = np.expand_dims(mask, axis=0)
+
+        return {
+            "image_s": image_s,
+            "image_m": image_m,
+            "image_l": image_l,
+            "mask": mask,
+        }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser("Jittor RN50_ZoomNeXt training script")
+    parser.add_argument("--config", required=True, type=str)
+    parser.add_argument("--data-cfg", required=True, type=str)
+    parser.add_argument("--output-dir", type=str, default="outputs_jittor")
+    parser.add_argument("--train-datasets", nargs="+", type=str)
+    parser.add_argument("--pretrained", action="store_true")
+    parser.add_argument("--encoder-weight-path", type=str, default="pretrained_weights/resnet50-timm.pth")
+    parser.add_argument("--resume-from", type=str)
+    parser.add_argument("--max-iters", type=int)
+    parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=112358)
+    parser.add_argument("--use-cuda", action="store_true")
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def load_cfg(args: argparse.Namespace):
+    cfg = Config.fromfile(args.config)
+    cfg.merge_from_dict(
+        {
+            "data_cfg": args.data_cfg,
+            "output_dir": args.output_dir,
+            "pretrained": args.pretrained,
+        }
+    )
+    with open(args.data_cfg, mode="r", encoding="utf-8") as f:
+        cfg.dataset_infos = yaml.safe_load(f)
+    return cfg
+
+
+def batch_indices(num_samples: int, batch_size: int, *, seed: int, drop_last: bool = True):
+    rng = np.random.default_rng(seed)
+    indices = np.arange(num_samples)
+    rng.shuffle(indices)
+    for start in range(0, num_samples, batch_size):
+        batch = indices[start : start + batch_size]
+        if len(batch) < batch_size and drop_last:
+            continue
+        yield batch.tolist()
+
+
+def collate_samples(samples: list[dict]) -> dict[str, np.ndarray]:
+    return {key: np.stack([sample[key] for sample in samples], axis=0).astype(np.float32) for key in samples[0]}
+
+
+def filter_trainable(params):
+    return [param for param in params if getattr(param, "requires_grad", True)]
+
+
+def group_params_jt(model, group_mode: str, initial_lr: float, optim_cfg: dict):
+    if group_mode == "all":
+        return [param for _, param in model.named_parameters() if getattr(param, "requires_grad", True)]
+    if group_mode == "finetune":
+        params_groups = model.get_grouped_params()
+        return [
+            {
+                "params": filter_trainable(params_groups["pretrained"]),
+                "lr": optim_cfg.get("diff_factor", 0.1) * initial_lr,
+            },
+            {
+                "params": filter_trainable(params_groups["retrained"]),
+                "lr": initial_lr,
+            },
+        ]
+    raise NotImplementedError(f"Unsupported group_mode for current Jittor script: {group_mode}")
+
+
+def construct_optimizer_jt(jt, model, initial_lr: float, mode: str, group_mode: str, optim_cfg: dict):
+    params = group_params_jt(model, group_mode=group_mode, initial_lr=initial_lr, optim_cfg=optim_cfg)
+    if mode == "adam":
+        optimizer = jt.optim.Adam(
+            params=params,
+            lr=initial_lr,
+            betas=tuple(optim_cfg.get("betas", (0.9, 0.999))),
+            weight_decay=optim_cfg.get("weight_decay", 0),
+        )
+    elif mode == "adamw":
+        optimizer = jt.optim.AdamW(
+            params=params,
+            lr=initial_lr,
+            betas=tuple(optim_cfg.get("betas", (0.9, 0.999))),
+            weight_decay=optim_cfg.get("weight_decay", 0),
+        )
+    elif mode == "sgd":
+        optimizer = jt.optim.SGD(
+            params=params,
+            lr=initial_lr,
+            momentum=optim_cfg.get("momentum", 0),
+            weight_decay=optim_cfg.get("weight_decay", 0),
+            nesterov=optim_cfg.get("nesterov", False),
+        )
+    else:
+        raise NotImplementedError(mode)
+    return optimizer
+
+
+def lr_groups(optimizer) -> list[float]:
+    return [group.get("lr", optimizer.lr) for group in optimizer.param_groups]
+
+
+def lr_string(optimizer) -> str:
+    return ",".join(f"{lr:.3e}" for lr in lr_groups(optimizer))
+
+
+def maybe_freeze_encoder(model, freeze_encoder: bool):
+    if not freeze_encoder:
+        return
+    for _, param in model.encoder.named_parameters():
+        param.requires_grad = False
+
+
+def maybe_freeze_bn_stats(model, freeze_status: bool):
+    if freeze_status:
+        model.encoder.eval()
+
+
+def save_checkpoint(jt, model, save_dir: Path, step: int):
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / f"step_{step:06d}.pkl"
+    jt.save(model.state_dict(), str(save_path))
+    return save_path
+
+
+def main() -> int:
+    args = parse_args()
+    set_seed(args.seed)
+    cfg = load_cfg(args)
+
+    import jittor as jt
+
+    jt.flags.use_cuda = 1 if args.use_cuda else 0
+
+    train_names = args.train_datasets or list(cfg.train.data.names)
+    dataset = ImageTrainDatasetJT(
+        dataset_infos={data_name: cfg.dataset_infos[data_name] for data_name in train_names},
+        shape=cfg.train.data.shape,
+    )
+    if len(dataset) == 0:
+        raise SystemExit("The training dataset is empty. Please check --data-cfg and dataset paths.")
+
+    model = RN50_ZoomNeXt_JT(
+        pretrained=args.pretrained,
+        num_frames=1,
+        input_norm=True,
+        mid_dim=64,
+        siu_groups=4,
+        hmu_groups=6,
+        weight_path=args.encoder_weight_path,
+    )
+    if args.resume_from:
+        model.load_state_dict(jt.load(args.resume_from))
+    model.train()
+
+    maybe_freeze_encoder(model, cfg.train.bn.freeze_encoder)
+
+    optimizer = construct_optimizer_jt(
+        jt=jt,
+        model=model,
+        initial_lr=cfg.train.lr,
+        mode=cfg.train.optimizer.mode,
+        group_mode=cfg.train.optimizer.group_mode,
+        optim_cfg=cfg.train.optimizer.cfg,
+    )
+
+    output_dir = Path(args.output_dir)
+    checkpoint_dir = output_dir / "checkpoints"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    batch_size = int(cfg.train.batch_size)
+    num_epochs = int(cfg.train.num_epochs)
+    total_iters = args.max_iters or (num_epochs * max(1, len(dataset) // batch_size))
+    curr_iter = 0
+
+    start_time = time.perf_counter()
+    for epoch in range(num_epochs):
+        model.train()
+        maybe_freeze_bn_stats(model, cfg.train.bn.freeze_status)
+
+        for batch_ids in batch_indices(len(dataset), batch_size, seed=args.seed + epoch, drop_last=True):
+            samples = [dataset[idx] for idx in batch_ids]
+            np_batch = collate_samples(samples)
+            jt_batch = {key: jt.array(value) for key, value in np_batch.items()}
+
+            iter_percentage = curr_iter / max(total_iters - 1, 1)
+            outputs = model(data=jt_batch, iter_percentage=iter_percentage)
+            loss = outputs["loss"]
+            optimizer.step(loss)
+
+            item = {
+                "iter": curr_iter,
+                "epoch": epoch,
+                "lr": lr_groups(optimizer),
+                "lr_string": lr_string(optimizer),
+                "loss": float(loss.numpy()),
+                "loss_str": outputs["loss_str"],
+                "shape": list(np_batch["mask"].shape),
+            }
+            print(json.dumps(item, ensure_ascii=False))
+
+            curr_iter += 1
+            if curr_iter % args.save_every == 0 or curr_iter == total_iters:
+                save_path = save_checkpoint(jt, model, checkpoint_dir, curr_iter)
+                print(json.dumps({"checkpoint": str(save_path)}, ensure_ascii=False))
+
+            if curr_iter >= total_iters:
+                break
+        if curr_iter >= total_iters:
+            break
+
+    final_path = save_checkpoint(jt, model, checkpoint_dir, curr_iter)
+    elapsed = time.perf_counter() - start_time
+    print(json.dumps({"final_checkpoint": str(final_path), "elapsed_sec": elapsed}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+#### 这个训练入口脚本做了什么
+
+这个脚本不是只做对照，而是真正执行训练 step。
+
+它做了下面几件事：
+
+1. 从 `--config` 读取训练超参数
+2. 从 `--data-cfg` 读取数据集路径配置
+3. 复刻 `ImageTrainDataset` 的图像增强和多尺度输入生成
+4. 构建 `RN50_ZoomNeXt_JT`
+5. 按 `group_mode` 组装 Jittor optimizer
+6. 调用 `optimizer.step(loss)` 进行参数更新
+7. 定期保存 Jittor checkpoint
+
+#### 为什么这里先支持 `all` 和 `finetune`
+
+当前 `resnet50` 路线的原始训练配置本身就是：
+
+- `optimizer.mode = "adam"`
+- `optimizer.group_mode = "finetune"`
+
+所以在训练入口里，优先把当前真正会用到的两种分组模式补齐：
+
+- `all`
+- `finetune`
+
+这样可以优先保证当前迁移目标可训练。  
+如果后面继续迁移其他 backbone 或其他实验配置，再扩到 `r3`、`yolov5` 等其他 group mode。
+
+### 14.4 Ubuntu 容器中的验证命令
+
+训练分支对照验证命令：
+
+```bash
+python3 scripts/validate_jittor_rn50_zoomnext_train.py
+```
+
+如果需要显式指定 encoder 预训练权重：
+
+```bash
+python3 scripts/validate_jittor_rn50_zoomnext_train.py --encoder-weight-path pretrained_weights/resnet50-timm.pth
+```
+
+### 14.5 Ubuntu 容器中的最小训练命令
+
+如果你已经有本地数据集配置文件，可以直接跑最小训练 smoke test：
+
+```bash
+python3 scripts/train_jittor_rn50_zoomnext.py \
+  --config configs/icod_train.py \
+  --data-cfg /path/to/dataset.yaml \
+  --pretrained \
+  --use-cuda \
+  --max-iters 2 \
+  --save-every 2
+```
+
+如果你的数据集配置文件里名字和 `configs/icod_train.py` 一致，这条命令会：
+
+- 读取训练集配置
+- 跑 2 个训练 iter
+- 打印 loss 与 lr
+- 保存一个 Jittor checkpoint
+
+### 14.6 当前阶段状态更新
+
+到目前为止，当前 `resnet50` 迁移链路已经覆盖：
+
+- 模块级前向迁移
+- backbone 迁移
+- 整网前向迁移
+- 训练分支接口迁移
+- 训练分支对照验证脚本
+- 基础训练入口脚本
+
+当前还等待回填验证结果的部分包括：
+
+- `validate_jittor_rn50_zoomnext_train.py`
+- `train_jittor_rn50_zoomnext.py` 的容器 smoke test
