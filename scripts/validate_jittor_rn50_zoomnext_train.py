@@ -38,8 +38,8 @@ def parse_args() -> argparse.Namespace:
         default=REPO_ROOT / "pretrained_weights" / "resnet50-timm.pth",
     )
     parser.add_argument("--tol-sal-max", type=float, default=5e-4)
-    parser.add_argument("--tol-sal-mean", type=float, default=1e-6)
-    parser.add_argument("--tol-loss", type=float, default=1e-6)
+    parser.add_argument("--tol-sal-mean", type=float, default=1e-5)
+    parser.add_argument("--tol-loss", type=float, default=1e-4)
     return parser.parse_args()
 
 

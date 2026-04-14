@@ -50,6 +50,10 @@ def _is_buffer_like_parameter(name: str) -> bool:
     return name.endswith("running_mean") or name.endswith("running_var") or name.endswith("num_batches_tracked")
 
 
+def _is_unused_backbone_head_parameter(name: str) -> bool:
+    return name.startswith("encoder.fc.")
+
+
 class _ZoomNeXt_Base(nn.Module):
     @staticmethod
     def get_coef(iter_percentage=1, method="cos", milestones=(0, 1)):
@@ -102,6 +106,8 @@ class _ZoomNeXt_Base(nn.Module):
         for name, param in self.named_parameters():
             if _is_buffer_like_parameter(name):
                 continue
+            if _is_unused_backbone_head_parameter(name):
+                continue
             if name.startswith("encoder.patch_embed1."):
                 param.requires_grad = False
                 param_groups["fixed"].append(param)
@@ -138,6 +144,11 @@ class RN50_ZoomNeXt_JT(_ZoomNeXt_Base):
         del kwargs
 
         self.encoder = build_resnet50(pretrained=pretrained, weight_path=weight_path)
+        if hasattr(self.encoder, "fc"):
+            if hasattr(self.encoder.fc, "weight") and self.encoder.fc.weight is not None:
+                self.encoder.fc.weight.requires_grad = False
+            if hasattr(self.encoder.fc, "bias") and self.encoder.fc.bias is not None:
+                self.encoder.fc.bias.requires_grad = False
 
         self.tra_5 = SimpleASPP(in_dim=2048, out_dim=mid_dim)
         self.siu_5 = MHSIU(mid_dim, siu_groups)
