@@ -5752,3 +5752,53 @@ python3 scripts/train_jittor_rn50_zoomnext.py \
 1. 是否能成功读取数据集配置
 2. 是否能完成至少 1 到 2 个训练 iter
 3. 是否能正确保存 checkpoint
+
+### 14.16 修复导入后的最小训练 smoke test 当前进展
+
+用户在 Ubuntu 容器中重新执行：
+
+```bash
+python3 scripts/train_jittor_rn50_zoomnext.py \
+  --config configs/icod_train.py \
+  --data-cfg ./dataset.yaml \
+  --pretrained \
+  --use-cuda \
+  --max-iters 2 \
+  --save-every 2
+```
+
+当前已经返回的输出包括：
+
+```text
+[i] CUDA enabled.
+{"dataset": "cod10k_tr", "length": 4040}
+
+Compiling Operators(83/83) used: 20.3s eta: 0s
+[w] forward_ algorithm cache is full
+```
+
+#### 这说明什么
+
+到这一步为止，训练入口已经成功越过了前面的导入问题，并且已经确认：
+
+1. Jittor CUDA 已正常启用
+2. 数据集配置 `./dataset.yaml` 已成功读取
+3. 训练集 `cod10k_tr` 已成功索引，长度为 `4040`
+4. 训练所需算子已经完成编译
+
+当前看到的：
+
+```text
+forward_ algorithm cache is full
+```
+
+是 Jittor/cuDNN 的运行时警告，通常影响的是卷积算法缓存与性能选择，不表示训练逻辑失败，也不等同于异常退出。
+
+#### 当前判断
+
+这说明 `train_jittor_rn50_zoomnext.py` 已经真正进入训练执行阶段。  
+接下来还需要继续观察后续输出，确认：
+
+- 是否打印出 `iter/loss/lr`
+- 是否能跑满 `2` 个 iter
+- 是否能保存 checkpoint
