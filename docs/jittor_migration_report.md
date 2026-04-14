@@ -5674,3 +5674,81 @@ python3 scripts/validate_jittor_rn50_zoomnext_train.py
 ```
 
 如果这次通过，就说明当前 `resnet50` 路线已经不只是“推理完成”，而是训练链路也已经闭环。
+
+### 14.13 最小训练 smoke test 首次运行结果与问题定位
+
+用户在 Ubuntu 容器中执行：
+
+```bash
+python3 scripts/train_jittor_rn50_zoomnext.py \
+  --config configs/icod_train.py \
+  --data-cfg ./dataset.yaml \
+  --pretrained \
+  --use-cuda \
+  --max-iters 2 \
+  --save-every 2
+```
+
+得到的报错如下：
+
+```text
+Traceback (most recent call last):
+  File "scripts/train_jittor_rn50_zoomnext.py", line 19, in <module>
+    from jittor_impl.models import RN50_ZoomNeXt_JT
+ModuleNotFoundError: No module named 'jittor_impl'
+```
+
+#### 这次报错说明什么
+
+这不是训练逻辑本身出错，也不是数据集配置出错，而是训练入口脚本少了仓库根目录注入。
+
+前面所有验证脚本都包含了：
+
+```python
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+```
+
+这样脚本无论从仓库根目录还是其他位置启动，都能正确导入：
+
+- `jittor_impl`
+- `methods`
+- `utils`
+
+而 `train_jittor_rn50_zoomnext.py` 初版漏掉了这一段，所以运行时找不到 `jittor_impl`。
+
+### 14.14 针对本次问题的修复
+
+在 `scripts/train_jittor_rn50_zoomnext.py` 中补入：
+
+```python
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+```
+
+这样训练入口脚本的导入行为就和前面的验证脚本保持一致。
+
+### 14.15 修复后的下一次训练命令
+
+请在 Ubuntu 容器中重新执行：
+
+```bash
+python3 scripts/train_jittor_rn50_zoomnext.py \
+  --config configs/icod_train.py \
+  --data-cfg ./dataset.yaml \
+  --pretrained \
+  --use-cuda \
+  --max-iters 2 \
+  --save-every 2
+```
+
+新的输出回传后，需要重点观察：
+
+1. 是否能成功读取数据集配置
+2. 是否能完成至少 1 到 2 个训练 iter
+3. 是否能正确保存 checkpoint
