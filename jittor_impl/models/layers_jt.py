@@ -101,14 +101,14 @@ class MHSIU(nn.Module):
         attn = self.conv_lms(lms)
         bt, _, h, w = attn.shape
         attn = attn.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
-        attn = attn.transpose((0, 2, 1, 3, 4, 5))
+        attn = jt.permute(attn, 0, 2, 1, 3, 4, 5)
         attn = attn.reshape((bt * self.num_groups, 3 * self.group_dim, h, w))
         attn = self.trans(attn)
         attn = attn.unsqueeze(dim=2)
 
         x = self.initial_merge(lms)
         x = x.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
-        x = x.transpose((0, 2, 1, 3, 4, 5))
+        x = jt.permute(x, 0, 2, 1, 3, 4, 5)
         x = x.reshape((bt * self.num_groups, 3, self.group_dim, h, w))
         x = (attn * x).sum(dim=1)
         x = x.reshape((bt, self.num_groups, self.group_dim, h, w))

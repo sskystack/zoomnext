@@ -1780,3 +1780,95 @@ python3 scripts/validate_jittor_mhsiu.py
 - 是否还会出现 shape 类型相关报错
 - 是否能成功跑出 `max_abs_err` 和 `mean_abs_err`
 - 误差是否进入 `1e-5` / `1e-6` 阈值范围
+
+### 9.9 第二轮 `MHSIU` 验证结果与进一步定位
+
+修复 `AdaptiveMaxPool2d` 尺寸类型之后，你重新执行了：
+
+```bash
+python3 scripts/validate_jittor_mhsiu.py
+```
+
+得到的结果是：
+
+```json
+{
+  "name": "MHSIU",
+  "shape": [2, 16, 11, 13],
+  "max_abs_err": 0.3329448103904724,
+  "mean_abs_err": 0.03643105924129486
+}
+```
+
+最终结论：
+
+```text
+Validation failed: max_abs_err=3.329448e-01, mean_abs_err=3.643106e-02
+```
+
+这说明：
+
+- 当前 `MHSIU` 已经能完整跑通前向
+- 权重加载和池化尺寸类型问题都已排除
+- 但数值结果仍明显偏离 PyTorch 版本
+
+因此当前问题已经从“接口兼容性问题”进入到了“张量重排或维度语义问题”。
+
+### 9.10 当前优先怀疑点
+
+`MHSIU` 中最可疑的部分是这两段由 `einops.rearrange` 手工展开后的维度重排：
+
+```python
+attn = attn.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+attn = attn.transpose((0, 2, 1, 3, 4, 5))
+```
+
+以及：
+
+```python
+x = x.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+x = x.transpose((0, 2, 1, 3, 4, 5))
+```
+
+虽然从数学上看这两步是想对应原仓库里的 `rearrange`，但在 Jittor 中：
+
+- `transpose` 的语义不一定完全等价于 PyTorch `permute`
+- 如果这里维度重排行为偏了，后续注意力分组顺序就会完全错位
+
+这类错位通常会导致“模型能跑，但误差非常大”，和当前现象一致。
+
+### 9.11 针对本次失败的修复方向
+
+本次修复把这两处都改成更明确的 `permute`：
+
+```python
+attn = attn.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+attn = jt.permute(attn, 0, 2, 1, 3, 4, 5)
+```
+
+以及：
+
+```python
+x = x.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+x = jt.permute(x, 0, 2, 1, 3, 4, 5)
+```
+
+这样改的目的不是“换一种写法”，而是：
+
+- 更明确地表达这是一个完整维度重排
+- 尽量避免 `transpose` 在 Jittor 中与预期语义不一致
+- 让它更贴近 PyTorch 中 `permute` / `einops.rearrange` 的行为
+
+### 9.12 下一次验证命令
+
+请继续使用同一条命令重新验证：
+
+```bash
+python3 scripts/validate_jittor_mhsiu.py
+```
+
+这次回传时，需要重点关注：
+
+- 误差是否显著下降
+- 是否已经进入 `1e-5` / `1e-6` 阈值范围
+- 如果仍然不通过，下一步就需要进一步比较 `MHSIU` 的中间张量
