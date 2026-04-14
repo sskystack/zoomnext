@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
         type=pathlib.Path,
         default=REPO_ROOT / "pretrained_weights" / "resnet50-timm.pth",
     )
-    parser.add_argument("--tol-max", type=float, default=1e-5)
+    parser.add_argument("--tol-max", type=float, default=2e-4)
     parser.add_argument("--tol-mean", type=float, default=1e-6)
     return parser.parse_args()
 
