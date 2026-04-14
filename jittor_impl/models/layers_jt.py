@@ -91,14 +91,80 @@ class DifferenceAwareOps(nn.Module):
         return x + shifted_x_tmp
 
 
+class _GlobalAvgPool2d(nn.Module):
+    def execute(self, x: jt.Var) -> jt.Var:
+        return x.mean(dims=(2, 3), keepdims=True)
+
+
 class RGPU(nn.Module):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, in_c, num_groups=6, hidden_dim=None, num_frames=1):
         super().__init__()
-        self.args = args
-        self.kwargs = kwargs
+        self.num_groups = num_groups
+        self.hidden_dim = hidden_dim or in_c // 2
+        expand_dim = self.hidden_dim * num_groups
+
+        self.expand_conv = ConvBNReLU(in_c, expand_dim, 1)
+
+        self.gate_pool = _GlobalAvgPool2d()
+        self.gate_conv1 = nn.Conv2d(num_groups * self.hidden_dim, self.hidden_dim, 1)
+        self.gate_relu = nn.ReLU()
+        self.gate_conv2 = nn.Conv2d(self.hidden_dim, num_groups * self.hidden_dim, 1)
+        self.gate_softmax = nn.Softmax(dim=1)
+
+        setattr(self, "interact_0", ConvBNReLU(self.hidden_dim, 3 * self.hidden_dim, 3, 1, 1))
+        for group_id in range(1, num_groups - 1):
+            setattr(self, f"interact_{group_id}", ConvBNReLU(2 * self.hidden_dim, 3 * self.hidden_dim, 3, 1, 1))
+        setattr(self, f"interact_{num_groups - 1}", ConvBNReLU(2 * self.hidden_dim, 2 * self.hidden_dim, 3, 1, 1))
+
+        self.fuse_diff = DifferenceAwareOps(num_frames=num_frames)
+        self.fuse_conv = ConvBNReLU(num_groups * self.hidden_dim, in_c, 3, 1, 1, act_name=None)
+        self.final_relu = nn.ReLU()
 
     def execute(self, x: jt.Var) -> jt.Var:
-        raise NotImplementedError("RGPU will be migrated in the next step.")
+        expanded = self.expand_conv(x)
+        bt, _, h, w = expanded.shape
+        xs = expanded.reshape((bt, self.num_groups, self.hidden_dim, h, w))
+
+        outs = []
+        gates = []
+
+        group_id = 0
+        curr_x = xs[:, group_id]
+        branch_out = getattr(self, f"interact_{group_id}")(curr_x)
+        curr_out = branch_out[:, : self.hidden_dim]
+        curr_fork = branch_out[:, self.hidden_dim : 2 * self.hidden_dim]
+        curr_gate = branch_out[:, 2 * self.hidden_dim : 3 * self.hidden_dim]
+        outs.append(curr_out)
+        gates.append(curr_gate)
+
+        for group_id in range(1, self.num_groups - 1):
+            curr_x = jt.concat([xs[:, group_id], curr_fork], dim=1)
+            branch_out = getattr(self, f"interact_{group_id}")(curr_x)
+            curr_out = branch_out[:, : self.hidden_dim]
+            curr_fork = branch_out[:, self.hidden_dim : 2 * self.hidden_dim]
+            curr_gate = branch_out[:, 2 * self.hidden_dim : 3 * self.hidden_dim]
+            outs.append(curr_out)
+            gates.append(curr_gate)
+
+        group_id = self.num_groups - 1
+        curr_x = jt.concat([xs[:, group_id], curr_fork], dim=1)
+        branch_out = getattr(self, f"interact_{group_id}")(curr_x)
+        curr_out = branch_out[:, : self.hidden_dim]
+        curr_gate = branch_out[:, self.hidden_dim : 2 * self.hidden_dim]
+        outs.append(curr_out)
+        gates.append(curr_gate)
+
+        out = jt.concat(outs, dim=1)
+        gate = jt.concat(gates, dim=1)
+        gate = self.gate_pool(gate)
+        gate = self.gate_conv1(gate)
+        gate = self.gate_relu(gate)
+        gate = self.gate_conv2(gate)
+        gate = self.gate_softmax(gate)
+
+        out = self.fuse_diff(out * gate)
+        out = self.fuse_conv(out)
+        return self.final_relu(out + x)
 
 
 class MHSIU(nn.Module):

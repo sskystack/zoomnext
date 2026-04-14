@@ -2784,3 +2784,513 @@ Validation passed.
 
 继续迁移 `RGPU`。  
 因为它直接依赖 `DifferenceAwareOps`，现在时序差分模块已经验证通过，正是推进 `RGPU` 的合适时机。
+
+## 11. 第五轮更新：迁移 `RGPU`
+
+这一轮开始正式迁移 `methods/zoomnext/layers.py` 中的第四个核心模块：`RGPU`。
+
+本轮目标：
+
+- 把 `RGPU` 从 PyTorch 等价迁移到 Jittor
+- 复用已经通过验证的 `DifferenceAwareOps`
+- 提供单模块验证脚本
+
+### 11.1 本轮修改的文件
+
+- 修改 `jittor_impl/models/layers_jt.py`
+- 新增 `scripts/validate_jittor_rgpu.py`
+
+### 11.2 `jittor_impl/models/layers_jt.py` 最新完整代码
+
+```python
+"""Jittor counterparts for the common ZoomNeXt layers.
+
+This file is migrated progressively. Each layer is ported one by one and
+validated against the PyTorch reference before the next layer lands.
+"""
+
+from __future__ import annotations
+
+import math
+
+import jittor as jt
+from jittor import nn
+
+from .ops_jt import ConvBNReLU, adaptive_avg_pool2d_pt, adaptive_max_pool2d_pt, resize_to
+
+
+class SimpleASPP(nn.Module):
+    def __init__(self, in_dim, out_dim, dilation=3):
+        super().__init__()
+        self.out_dim = out_dim
+        self.conv1x1_1 = ConvBNReLU(in_dim, 2 * out_dim, 1)
+        self.conv1x1_2 = ConvBNReLU(out_dim, out_dim, 1)
+        self.conv3x3_1 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.conv3x3_2 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.conv3x3_3 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.fuse = nn.Sequential(
+            ConvBNReLU(5 * out_dim, out_dim, 1),
+            ConvBNReLU(out_dim, out_dim, 3, 1, 1),
+        )
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        y = self.conv1x1_1(x)
+        y1 = y[:, : self.out_dim, :, :]
+        y5 = y[:, self.out_dim :, :, :]
+
+        y2 = self.conv3x3_1(y1)
+        y3 = self.conv3x3_2(y2)
+        y4 = self.conv3x3_3(y3)
+
+        y0 = y5.mean(dims=(2, 3), keepdims=True)
+        y0 = self.conv1x1_2(y0)
+        y0 = resize_to(y0, tgt_hw=x.shape[-2:])
+        return self.fuse(jt.concat([y0, y1, y2, y3, y4], dim=1))
+
+
+class DifferenceAwareOps(nn.Module):
+    def __init__(self, num_frames):
+        super().__init__()
+        self.num_frames = num_frames
+        self.temperal_proj_norm = nn.LayerNorm(num_frames, elementwise_affine=False)
+        self.temperal_proj_kv = nn.Linear(num_frames, 2 * num_frames, bias=False)
+
+        conv1 = nn.Conv2d(num_frames, num_frames, 3, 1, 1, bias=False)
+        relu = nn.ReLU()
+        conv2 = nn.Conv2d(num_frames, num_frames, 3, 1, 1, bias=False)
+        conv2.weight.assign(jt.zeros(conv2.weight.shape))
+
+        self.temperal_proj = nn.Sequential()
+        self.temperal_proj.add_module("0", conv1)
+        self.temperal_proj.add_module("1", relu)
+        self.temperal_proj.add_module("2", conv2)
+        self.softmax_y = nn.Softmax(dim=2)
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        if self.num_frames == 1:
+            return x
+
+        bt, c, h, w = x.shape
+        batch_size = bt // self.num_frames
+
+        unshifted_x_tmp = x.reshape((batch_size, self.num_frames, c, h, w))
+        unshifted_x_tmp = jt.permute(unshifted_x_tmp, 0, 2, 3, 4, 1)
+
+        shifted_x_tmp = jt.concat([unshifted_x_tmp[..., -1:], unshifted_x_tmp[..., :-1]], dim=-1)
+        diff_q = shifted_x_tmp - unshifted_x_tmp
+        diff_q = self.temperal_proj_norm(diff_q)
+
+        diff_kv = self.temperal_proj_kv(diff_q)
+        diff_k = diff_kv[..., : self.num_frames]
+        diff_v = diff_kv[..., self.num_frames :]
+
+        diff_qk = jt.linalg.einsum("bxhwt,byhwt->bxyt", diff_q, diff_k) * (h * w) ** -0.5
+        temperal_diff = jt.linalg.einsum("bxyt,byhwt->bxhwt", self.softmax_y(diff_qk), diff_v)
+
+        temperal_diff = jt.permute(temperal_diff, 0, 1, 4, 2, 3)
+        temperal_diff = temperal_diff.reshape((batch_size * c, self.num_frames, h, w))
+        shifted_x_tmp = self.temperal_proj(temperal_diff)
+        shifted_x_tmp = shifted_x_tmp.reshape((batch_size, c, self.num_frames, h, w))
+        shifted_x_tmp = jt.permute(shifted_x_tmp, 0, 2, 1, 3, 4)
+        shifted_x_tmp = shifted_x_tmp.reshape((bt, c, h, w))
+        return x + shifted_x_tmp
+
+
+class _GlobalAvgPool2d(nn.Module):
+    def execute(self, x: jt.Var) -> jt.Var:
+        return x.mean(dims=(2, 3), keepdims=True)
+
+
+class RGPU(nn.Module):
+    def __init__(self, in_c, num_groups=6, hidden_dim=None, num_frames=1):
+        super().__init__()
+        self.num_groups = num_groups
+        self.hidden_dim = hidden_dim or in_c // 2
+        expand_dim = self.hidden_dim * num_groups
+
+        self.expand_conv = ConvBNReLU(in_c, expand_dim, 1)
+
+        self.gate_pool = _GlobalAvgPool2d()
+        self.gate_conv1 = nn.Conv2d(num_groups * self.hidden_dim, self.hidden_dim, 1)
+        self.gate_relu = nn.ReLU()
+        self.gate_conv2 = nn.Conv2d(self.hidden_dim, num_groups * self.hidden_dim, 1)
+        self.gate_softmax = nn.Softmax(dim=1)
+
+        setattr(self, "interact_0", ConvBNReLU(self.hidden_dim, 3 * self.hidden_dim, 3, 1, 1))
+        for group_id in range(1, num_groups - 1):
+            setattr(self, f"interact_{group_id}", ConvBNReLU(2 * self.hidden_dim, 3 * self.hidden_dim, 3, 1, 1))
+        setattr(self, f"interact_{num_groups - 1}", ConvBNReLU(2 * self.hidden_dim, 2 * self.hidden_dim, 3, 1, 1))
+
+        self.fuse_diff = DifferenceAwareOps(num_frames=num_frames)
+        self.fuse_conv = ConvBNReLU(num_groups * self.hidden_dim, in_c, 3, 1, 1, act_name=None)
+        self.final_relu = nn.ReLU()
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        expanded = self.expand_conv(x)
+        bt, _, h, w = expanded.shape
+        xs = expanded.reshape((bt, self.num_groups, self.hidden_dim, h, w))
+
+        outs = []
+        gates = []
+
+        group_id = 0
+        curr_x = xs[:, group_id]
+        branch_out = getattr(self, f"interact_{group_id}")(curr_x)
+        curr_out = branch_out[:, : self.hidden_dim]
+        curr_fork = branch_out[:, self.hidden_dim : 2 * self.hidden_dim]
+        curr_gate = branch_out[:, 2 * self.hidden_dim : 3 * self.hidden_dim]
+        outs.append(curr_out)
+        gates.append(curr_gate)
+
+        for group_id in range(1, self.num_groups - 1):
+            curr_x = jt.concat([xs[:, group_id], curr_fork], dim=1)
+            branch_out = getattr(self, f"interact_{group_id}")(curr_x)
+            curr_out = branch_out[:, : self.hidden_dim]
+            curr_fork = branch_out[:, self.hidden_dim : 2 * self.hidden_dim]
+            curr_gate = branch_out[:, 2 * self.hidden_dim : 3 * self.hidden_dim]
+            outs.append(curr_out)
+            gates.append(curr_gate)
+
+        group_id = self.num_groups - 1
+        curr_x = jt.concat([xs[:, group_id], curr_fork], dim=1)
+        branch_out = getattr(self, f"interact_{group_id}")(curr_x)
+        curr_out = branch_out[:, : self.hidden_dim]
+        curr_gate = branch_out[:, self.hidden_dim : 2 * self.hidden_dim]
+        outs.append(curr_out)
+        gates.append(curr_gate)
+
+        out = jt.concat(outs, dim=1)
+        gate = jt.concat(gates, dim=1)
+        gate = self.gate_pool(gate)
+        gate = self.gate_conv1(gate)
+        gate = self.gate_relu(gate)
+        gate = self.gate_conv2(gate)
+        gate = self.gate_softmax(gate)
+
+        out = self.fuse_diff(out * gate)
+        out = self.fuse_conv(out)
+        return self.final_relu(out + x)
+
+
+class MHSIU(nn.Module):
+    def __init__(self, in_dim, num_groups=4):
+        super().__init__()
+        self.in_dim = in_dim
+        self.num_groups = num_groups
+        self.group_dim = in_dim // num_groups
+
+        self.conv_l_pre = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_s_pre = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+
+        self.conv_l = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_m = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_s = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+
+        self.conv_lms = ConvBNReLU(3 * in_dim, 3 * in_dim, 1)
+        self.initial_merge = ConvBNReLU(3 * in_dim, 3 * in_dim, 1)
+
+        self.trans = nn.Sequential(
+            ConvBNReLU(3 * self.group_dim, self.group_dim, 1),
+            ConvBNReLU(self.group_dim, self.group_dim, 3, 1, 1),
+            nn.Conv2d(self.group_dim, 3, 1),
+            nn.Softmax(dim=1),
+        )
+
+    def execute(self, l: jt.Var, m: jt.Var, s: jt.Var) -> jt.Var:
+        tgt_size = (int(m.shape[2]), int(m.shape[3]))
+
+        l = self.conv_l_pre(l)
+        l = adaptive_max_pool2d_pt(l, tgt_size) + adaptive_avg_pool2d_pt(l, tgt_size)
+        s = self.conv_s_pre(s)
+        s = resize_to(s, tgt_hw=tgt_size)
+
+        l = self.conv_l(l)
+        m = self.conv_m(m)
+        s = self.conv_s(s)
+        lms = jt.concat([l, m, s], dim=1)
+
+        attn = self.conv_lms(lms)
+        bt, _, h, w = attn.shape
+        attn = attn.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+        attn = jt.permute(attn, 0, 2, 1, 3, 4, 5)
+        attn = attn.reshape((bt * self.num_groups, 3 * self.group_dim, h, w))
+        attn = self.trans(attn)
+        attn = attn.unsqueeze(dim=2)
+
+        x = self.initial_merge(lms)
+        x = x.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+        x = jt.permute(x, 0, 2, 1, 3, 4, 5)
+        x = x.reshape((bt * self.num_groups, 3, self.group_dim, h, w))
+        x = (attn * x).sum(dim=1)
+        x = x.reshape((bt, self.num_groups, self.group_dim, h, w))
+        x = x.reshape((bt, self.num_groups * self.group_dim, h, w))
+        return x
+```
+
+解释：
+
+#### `RGPU` 的结构保持方式
+
+`RGPU` 是由三部分组成的：
+
+- `expand_conv`
+- 逐组递进交互 `interact`
+- `gate_genator + fuse + residual`
+
+这一轮实现里保持了与原仓库同样的执行顺序。
+
+#### 为什么 `interact` 没有直接用 `ModuleDict`
+
+PyTorch 原实现使用的是：
+
+```python
+self.interact = nn.ModuleDict()
+```
+
+Jittor 这里为了避免容器访问和权重加载行为不确定，改成了：
+
+- 把每个分组模块挂成独立属性，如 `interact_0`
+- 运行时用 `getattr(self, f"interact_{group_id}")` 调用
+
+这不会改变模型逻辑，但会影响参数键名，所以验证脚本里专门做了键名映射。
+
+#### 为什么 `gate_genator` 改成显式模块
+
+原仓库是一个 `Sequential`：
+
+```python
+nn.AdaptiveAvgPool2d((1, 1))
+nn.Conv2d(...)
+nn.ReLU(True)
+nn.Conv2d(...)
+nn.Softmax(dim=1)
+```
+
+这里改成显式的：
+
+- `gate_pool`
+- `gate_conv1`
+- `gate_relu`
+- `gate_conv2`
+- `gate_softmax`
+
+这样做的原因是：
+
+- 逻辑更透明
+- 与前面 `MHSIU` 的经验一致，可以更容易控制实现细节
+- 也方便做精确的 state_dict 键名映射
+
+#### 为什么 `gate_pool` 用全局平均而不是 `AdaptiveAvgPool2d((1,1))`
+
+输出尺寸为 `1x1` 时，全局平均池化和自适应平均池化本质上等价。  
+这里直接写成：
+
+```python
+x.mean(dims=(2, 3), keepdims=True)
+```
+
+可以避免再次引入框架之间的 adaptive pool 语义差异。
+
+#### 分组切块为什么不用 `chunk`
+
+和前面 `SimpleASPP` 一样，这里尽量使用：
+
+- `reshape`
+- 显式切片
+
+而不是依赖框架的 `chunk` 实现细节。  
+这样做的目的是把每一步通道布局都写清楚，便于后续如果需要调试时逐层定位。
+
+### 11.3 `scripts/validate_jittor_rgpu.py` 完整代码
+
+```python
+#!/usr/bin/env python3
+"""Validate the migrated Jittor RGPU against the PyTorch reference."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import random
+import sys
+
+import numpy as np
+import torch
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from methods.zoomnext.layers import RGPU as TorchRGPU
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate Jittor RGPU against PyTorch.")
+    parser.add_argument("--seed", type=int, default=20260414)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-frames", type=int, default=5)
+    parser.add_argument("--in-c", type=int, default=16)
+    parser.add_argument("--num-groups", type=int, default=4)
+    parser.add_argument("--hidden-dim", type=int, default=8)
+    parser.add_argument("--height", type=int, default=11)
+    parser.add_argument("--width", type=int, default=13)
+    parser.add_argument("--tol-max", type=float, default=1e-5)
+    parser.add_argument("--tol-mean", type=float, default=1e-6)
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def compare_arrays(name: str, pt_value: torch.Tensor, jt_value: np.ndarray) -> dict:
+    pt_arr = pt_value.detach().cpu().numpy().astype(np.float32)
+    jt_arr = np.asarray(jt_value, dtype=np.float32)
+    abs_err = np.abs(pt_arr - jt_arr)
+    return {
+        "name": name,
+        "shape": list(pt_arr.shape),
+        "max_abs_err": float(abs_err.max()),
+        "mean_abs_err": float(abs_err.mean()),
+    }
+
+
+def map_torch_state_dict_to_jittor(state_dict: dict) -> dict:
+    mapped = {}
+    for name, value in state_dict.items():
+        mapped_name = name
+        mapped_name = mapped_name.replace("gate_genator.1.", "gate_conv1.")
+        mapped_name = mapped_name.replace("gate_genator.3.", "gate_conv2.")
+        mapped_name = mapped_name.replace("fuse.0.", "fuse_diff.")
+        mapped_name = mapped_name.replace("fuse.1.", "fuse_conv.")
+        for group_id in range(100):
+            prefix = f"interact.{group_id}."
+            if mapped_name.startswith(prefix):
+                mapped_name = mapped_name.replace(prefix, f"interact_{group_id}.", 1)
+                break
+        mapped[mapped_name] = value.detach().cpu().numpy()
+    return mapped
+
+
+def main() -> int:
+    args = parse_args()
+    set_seed(args.seed)
+
+    try:
+        import jittor as jt
+    except ImportError as exc:
+        raise SystemExit(
+            "Jittor is not installed. Please install Jittor in the container before running this script."
+        ) from exc
+
+    from jittor_impl.models.layers_jt import RGPU as JittorRGPU
+
+    jt.flags.use_cuda = 0
+
+    x_np = np.random.randn(
+        args.batch_size * args.num_frames,
+        args.in_c,
+        args.height,
+        args.width,
+    ).astype(np.float32)
+    x_pt = torch.from_numpy(x_np)
+    x_jt = jt.array(x_np)
+
+    pt_model = TorchRGPU(
+        in_c=args.in_c,
+        num_groups=args.num_groups,
+        hidden_dim=args.hidden_dim,
+        num_frames=args.num_frames,
+    )
+    pt_model.eval()
+
+    jt_model = JittorRGPU(
+        in_c=args.in_c,
+        num_groups=args.num_groups,
+        hidden_dim=args.hidden_dim,
+        num_frames=args.num_frames,
+    )
+    jt_model.eval()
+    jt_model.load_state_dict(map_torch_state_dict_to_jittor(pt_model.state_dict()))
+
+    with torch.no_grad():
+        pt_output = pt_model(x_pt)
+    jt_output = jt_model(x_jt).numpy()
+
+    report = compare_arrays("RGPU", pt_output, jt_output)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    if report["max_abs_err"] > args.tol_max or report["mean_abs_err"] > args.tol_mean:
+        print(
+            "\nValidation failed: "
+            f"max_abs_err={report['max_abs_err']:.6e}, mean_abs_err={report['mean_abs_err']:.6e}"
+        )
+        return 1
+
+    print("\nValidation passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+解释：
+
+#### 这个脚本最关键的地方
+
+不是普通的随机输入对比，而是这一步：
+
+```python
+jt_model.load_state_dict(map_torch_state_dict_to_jittor(pt_model.state_dict()))
+```
+
+因为 `RGPU` 里有：
+
+- `interact`
+- `gate_genator`
+- `fuse`
+
+这几个子结构在 Jittor 版里为了实现可控性换了组织方式，所以这里必须做参数键名映射，才能保证比较的是“同权重”。
+
+#### 目前这轮的风险点
+
+`RGPU` 仍然是当前最复杂的模块，因为它把前面三个模块的行为都串起来了：
+
+- 卷积块
+- 分组级联交互
+- 门控生成
+- `DifferenceAwareOps`
+- 残差输出
+
+所以即使前面三个子模块都通过了，`RGPU` 也仍然需要独立验证。
+
+### 11.4 本轮验证命令
+
+Ubuntu 容器里直接运行：
+
+```bash
+python3 scripts/validate_jittor_rgpu.py
+```
+
+如果需要显式指定路径环境，也可以写成：
+
+```bash
+PYTHONPATH=. python3 scripts/validate_jittor_rgpu.py
+```
+
+### 11.5 当前阶段结论更新
+
+当前进度更新为：
+
+- 基础算子层已完成并验证通过
+- `SimpleASPP` 已完成并验证通过
+- `MHSIU` 已完成并验证通过
+- `DifferenceAwareOps` 已完成并验证通过
+- `RGPU` 已完成第一版实现
+- `RGPU` 验证脚本已新增
+
+但目前还没有收到 `RGPU` 的容器验证结果，因此它还不能算“已验证通过”。
