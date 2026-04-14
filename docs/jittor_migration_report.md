@@ -1357,3 +1357,361 @@ Validation passed.
 
 优先继续迁移 `MHSIU`。  
 原因是它依赖的基础模块已经就绪，而且比 `DifferenceAwareOps`、`RGPU` 更适合作为下一块独立验证对象。
+
+## 9. 第三轮更新：迁移 `MHSIU`
+
+这一轮开始正式迁移 `methods/zoomnext/layers.py` 中的第二个核心模块：`MHSIU`。
+
+本轮目标：
+
+- 把 `MHSIU` 从 PyTorch 等价迁移到 Jittor
+- 提供单模块验证脚本
+- 暂时不改动 `DifferenceAwareOps`、`RGPU`
+
+### 9.1 本轮修改的文件
+
+- 修改 `jittor_impl/models/layers_jt.py`
+- 新增 `scripts/validate_jittor_mhsiu.py`
+
+### 9.2 `jittor_impl/models/layers_jt.py` 最新完整代码
+
+```python
+"""Jittor counterparts for the common ZoomNeXt layers.
+
+This file is migrated progressively. Each layer is ported one by one and
+validated against the PyTorch reference before the next layer lands.
+"""
+
+from __future__ import annotations
+
+import jittor as jt
+from jittor import nn
+
+from .ops_jt import ConvBNReLU, resize_to
+
+
+class SimpleASPP(nn.Module):
+    def __init__(self, in_dim, out_dim, dilation=3):
+        super().__init__()
+        self.out_dim = out_dim
+        self.conv1x1_1 = ConvBNReLU(in_dim, 2 * out_dim, 1)
+        self.conv1x1_2 = ConvBNReLU(out_dim, out_dim, 1)
+        self.conv3x3_1 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.conv3x3_2 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.conv3x3_3 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.fuse = nn.Sequential(
+            ConvBNReLU(5 * out_dim, out_dim, 1),
+            ConvBNReLU(out_dim, out_dim, 3, 1, 1),
+        )
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        y = self.conv1x1_1(x)
+        y1 = y[:, : self.out_dim, :, :]
+        y5 = y[:, self.out_dim :, :, :]
+
+        y2 = self.conv3x3_1(y1)
+        y3 = self.conv3x3_2(y2)
+        y4 = self.conv3x3_3(y3)
+
+        y0 = y5.mean(dims=(2, 3), keepdims=True)
+        y0 = self.conv1x1_2(y0)
+        y0 = resize_to(y0, tgt_hw=x.shape[-2:])
+        return self.fuse(jt.concat([y0, y1, y2, y3, y4], dim=1))
+
+
+class DifferenceAwareOps(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.args = args
+        self.kwargs = kwargs
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        raise NotImplementedError("DifferenceAwareOps will be migrated in the next step.")
+
+
+class RGPU(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.args = args
+        self.kwargs = kwargs
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        raise NotImplementedError("RGPU will be migrated in the next step.")
+
+
+class MHSIU(nn.Module):
+    def __init__(self, in_dim, num_groups=4):
+        super().__init__()
+        self.in_dim = in_dim
+        self.num_groups = num_groups
+        self.group_dim = in_dim // num_groups
+
+        self.conv_l_pre = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_s_pre = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+
+        self.conv_l = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_m = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_s = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+
+        self.conv_lms = ConvBNReLU(3 * in_dim, 3 * in_dim, 1)
+        self.initial_merge = ConvBNReLU(3 * in_dim, 3 * in_dim, 1)
+
+        self.trans = nn.Sequential(
+            ConvBNReLU(3 * self.group_dim, self.group_dim, 1),
+            ConvBNReLU(self.group_dim, self.group_dim, 3, 1, 1),
+            nn.Conv2d(self.group_dim, 3, 1),
+            nn.Softmax(dim=1),
+        )
+
+    def execute(self, l: jt.Var, m: jt.Var, s: jt.Var) -> jt.Var:
+        tgt_size = m.shape[2:]
+
+        l = self.conv_l_pre(l)
+        l = nn.AdaptiveMaxPool2d(tgt_size)(l) + nn.AdaptiveAvgPool2d(tgt_size)(l)
+        s = self.conv_s_pre(s)
+        s = resize_to(s, tgt_hw=tgt_size)
+
+        l = self.conv_l(l)
+        m = self.conv_m(m)
+        s = self.conv_s(s)
+        lms = jt.concat([l, m, s], dim=1)
+
+        attn = self.conv_lms(lms)
+        bt, _, h, w = attn.shape
+        attn = attn.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+        attn = attn.transpose((0, 2, 1, 3, 4, 5))
+        attn = attn.reshape((bt * self.num_groups, 3 * self.group_dim, h, w))
+        attn = self.trans(attn)
+        attn = attn.unsqueeze(dim=2)
+
+        x = self.initial_merge(lms)
+        x = x.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+        x = x.transpose((0, 2, 1, 3, 4, 5))
+        x = x.reshape((bt * self.num_groups, 3, self.group_dim, h, w))
+        x = (attn * x).sum(dim=1)
+        x = x.reshape((bt, self.num_groups, self.group_dim, h, w))
+        x = x.reshape((bt, self.num_groups * self.group_dim, h, w))
+        return x
+```
+
+解释：
+
+#### `MHSIU` 的迁移思路
+
+这个模块的关键不只是卷积本身，而是三尺度特征融合时的张量重排。
+
+原仓库中最核心的两段 `einops.rearrange` 是：
+
+```python
+attn = rearrange(attn, "bt (nb ng d) h w -> (bt ng) (nb d) h w", nb=3, ng=self.num_groups)
+```
+
+和：
+
+```python
+x = rearrange(x, "bt (nb ng d) h w -> (bt ng) nb d h w", nb=3, ng=self.num_groups)
+```
+
+在 Jittor 中这里没有直接复用 `einops`，而是显式写成：
+
+- `reshape`
+- `transpose`
+- 再 `reshape`
+
+这样做的好处是：
+
+- 更容易逐维检查是否和原始通道布局完全一致
+- 更方便后续如果验证失败时按中间张量逐层排查
+
+#### 为什么 `group_dim = in_dim // num_groups`
+
+因为原仓库写的是：
+
+```python
+3 * in_dim // num_groups
+in_dim // num_groups
+```
+
+所以这里把每组通道数显式记成 `group_dim`，后面的 `reshape` 和 `ConvBNReLU` 都更清晰。
+
+#### `l` 分支为什么要同时做 max pool 和 avg pool
+
+这一行：
+
+```python
+l = nn.AdaptiveMaxPool2d(tgt_size)(l) + nn.AdaptiveAvgPool2d(tgt_size)(l)
+```
+
+是严格对应原仓库：
+
+```python
+l = F.adaptive_max_pool2d(l, tgt_size) + F.adaptive_avg_pool2d(l, tgt_size)
+```
+
+这一步不能简化成只保留一种池化，否则模块行为会变。
+
+#### 这个实现的关键风险点
+
+`MHSIU` 最容易出错的是下面几件事：
+
+- `reshape` 的通道拆分顺序不对
+- `transpose` 维度顺序不对
+- `attn.unsqueeze(dim=2)` 的位置不对
+- `sum(dim=1)` 的聚合维度不对
+
+所以这个模块一定要通过单模块对照验证之后，才能继续往下走。
+
+### 9.3 `scripts/validate_jittor_mhsiu.py` 完整代码
+
+```python
+#!/usr/bin/env python3
+"""Validate the migrated Jittor MHSIU against the PyTorch reference."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import random
+import sys
+
+import numpy as np
+import torch
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from methods.zoomnext.layers import MHSIU as TorchMHSIU
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate Jittor MHSIU against PyTorch.")
+    parser.add_argument("--seed", type=int, default=20260414)
+    parser.add_argument("--in-dim", type=int, default=16)
+    parser.add_argument("--num-groups", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--h-l", type=int, default=17)
+    parser.add_argument("--w-l", type=int, default=19)
+    parser.add_argument("--h-m", type=int, default=11)
+    parser.add_argument("--w-m", type=int, default=13)
+    parser.add_argument("--h-s", type=int, default=7)
+    parser.add_argument("--w-s", type=int, default=9)
+    parser.add_argument("--tol-max", type=float, default=1e-5)
+    parser.add_argument("--tol-mean", type=float, default=1e-6)
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def compare_arrays(name: str, pt_value: torch.Tensor, jt_value: np.ndarray) -> dict:
+    pt_arr = pt_value.detach().cpu().numpy().astype(np.float32)
+    jt_arr = np.asarray(jt_value, dtype=np.float32)
+    abs_err = np.abs(pt_arr - jt_arr)
+    return {
+        "name": name,
+        "shape": list(pt_arr.shape),
+        "max_abs_err": float(abs_err.max()),
+        "mean_abs_err": float(abs_err.mean()),
+    }
+
+
+def torch_state_dict_to_numpy(state_dict: dict) -> dict:
+    return {name: value.detach().cpu().numpy() for name, value in state_dict.items()}
+
+
+def main() -> int:
+    args = parse_args()
+    set_seed(args.seed)
+
+    try:
+        import jittor as jt
+    except ImportError as exc:
+        raise SystemExit(
+            "Jittor is not installed. Please install Jittor in the container before running this script."
+        ) from exc
+
+    from jittor_impl.models.layers_jt import MHSIU as JittorMHSIU
+
+    jt.flags.use_cuda = 0
+
+    l_np = np.random.randn(args.batch_size, args.in_dim, args.h_l, args.w_l).astype(np.float32)
+    m_np = np.random.randn(args.batch_size, args.in_dim, args.h_m, args.w_m).astype(np.float32)
+    s_np = np.random.randn(args.batch_size, args.in_dim, args.h_s, args.w_s).astype(np.float32)
+
+    l_pt, m_pt, s_pt = torch.from_numpy(l_np), torch.from_numpy(m_np), torch.from_numpy(s_np)
+    l_jt, m_jt, s_jt = jt.array(l_np), jt.array(m_np), jt.array(s_np)
+
+    pt_model = TorchMHSIU(args.in_dim, args.num_groups)
+    pt_model.eval()
+
+    jt_model = JittorMHSIU(args.in_dim, args.num_groups)
+    jt_model.eval()
+    jt_model.load_state_dict(torch_state_dict_to_numpy(pt_model.state_dict()))
+
+    with torch.no_grad():
+        pt_output = pt_model(l_pt, m_pt, s_pt)
+    jt_output = jt_model(l_jt, m_jt, s_jt).numpy()
+
+    report = compare_arrays("MHSIU", pt_output, jt_output)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    if report["max_abs_err"] > args.tol_max or report["mean_abs_err"] > args.tol_mean:
+        print(
+            "\nValidation failed: "
+            f"max_abs_err={report['max_abs_err']:.6e}, mean_abs_err={report['mean_abs_err']:.6e}"
+        )
+        return 1
+
+    print("\nValidation passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+解释：
+
+这个脚本的目标是把 `MHSIU` 单独拿出来验证，而不是放进整网里一起测。
+
+输入设计上故意用了三种不同空间尺寸：
+
+- `l`: 大尺寸
+- `m`: 中尺寸
+- `s`: 小尺寸
+
+这样才能真正覆盖：
+
+- `l` 分支自适应池化到 `m` 的逻辑
+- `s` 分支 resize 到 `m` 的逻辑
+- 后续三尺度融合逻辑
+
+### 9.4 本轮验证命令
+
+Ubuntu 容器里直接运行：
+
+```bash
+python3 scripts/validate_jittor_mhsiu.py
+```
+
+如果你想显式指定仓库路径环境，也可以用：
+
+```bash
+PYTHONPATH=. python3 scripts/validate_jittor_mhsiu.py
+```
+
+### 9.5 当前阶段结论更新
+
+当前进度更新为：
+
+- 基础算子层已完成并验证通过
+- `SimpleASPP` 已完成并验证通过
+- `MHSIU` 已完成代码迁移
+- `MHSIU` 验证脚本已新增
+
+但目前还没有收到 `MHSIU` 的容器验证结果，因此它还不能算“已验证通过”。

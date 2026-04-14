@@ -62,11 +62,55 @@ class RGPU(nn.Module):
 
 
 class MHSIU(nn.Module):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, in_dim, num_groups=4):
         super().__init__()
-        self.args = args
-        self.kwargs = kwargs
+        self.in_dim = in_dim
+        self.num_groups = num_groups
+        self.group_dim = in_dim // num_groups
+
+        self.conv_l_pre = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_s_pre = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+
+        self.conv_l = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_m = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_s = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+
+        self.conv_lms = ConvBNReLU(3 * in_dim, 3 * in_dim, 1)
+        self.initial_merge = ConvBNReLU(3 * in_dim, 3 * in_dim, 1)
+
+        self.trans = nn.Sequential(
+            ConvBNReLU(3 * self.group_dim, self.group_dim, 1),
+            ConvBNReLU(self.group_dim, self.group_dim, 3, 1, 1),
+            nn.Conv2d(self.group_dim, 3, 1),
+            nn.Softmax(dim=1),
+        )
 
     def execute(self, l: jt.Var, m: jt.Var, s: jt.Var) -> jt.Var:
-        del l, m, s
-        raise NotImplementedError("MHSIU will be migrated in the next step.")
+        tgt_size = m.shape[2:]
+
+        l = self.conv_l_pre(l)
+        l = nn.AdaptiveMaxPool2d(tgt_size)(l) + nn.AdaptiveAvgPool2d(tgt_size)(l)
+        s = self.conv_s_pre(s)
+        s = resize_to(s, tgt_hw=tgt_size)
+
+        l = self.conv_l(l)
+        m = self.conv_m(m)
+        s = self.conv_s(s)
+        lms = jt.concat([l, m, s], dim=1)
+
+        attn = self.conv_lms(lms)
+        bt, _, h, w = attn.shape
+        attn = attn.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+        attn = attn.transpose((0, 2, 1, 3, 4, 5))
+        attn = attn.reshape((bt * self.num_groups, 3 * self.group_dim, h, w))
+        attn = self.trans(attn)
+        attn = attn.unsqueeze(dim=2)
+
+        x = self.initial_merge(lms)
+        x = x.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+        x = x.transpose((0, 2, 1, 3, 4, 5))
+        x = x.reshape((bt * self.num_groups, 3, self.group_dim, h, w))
+        x = (attn * x).sum(dim=1)
+        x = x.reshape((bt, self.num_groups, self.group_dim, h, w))
+        x = x.reshape((bt, self.num_groups * self.group_dim, h, w))
+        return x
