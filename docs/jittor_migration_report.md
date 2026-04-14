@@ -5842,6 +5842,60 @@ progress.close()
 - 当前大致卡在第几个 iter
 - 是否已经真正完成参数更新
 
+### 14.20 将训练进度条改为更实时的阶段刷新
+
+在实际使用中，用户反馈虽然已经有 `tqdm`，但首个 iter 仍然要等到 `optimizer.step(loss)` 完成后才会看到明显变化，不够“实时”。
+
+为此，训练脚本继续做了一次进度显示增强：不再只在 step 完成后更新，而是在每个 iter 的关键阶段即时刷新状态。
+
+核心新增代码如下：
+
+```python
+def emit_progress(progress, *, epoch: int, curr_iter: int, stage: str, extra: str = "") -> None:
+    progress.set_description(f"[JT-TRAIN][E{epoch}]")
+    suffix = f"iter={curr_iter} stage={stage}"
+    if extra:
+        suffix = f"{suffix} {extra}"
+    progress.set_postfix_str(suffix)
+    progress.refresh()
+```
+
+并在训练循环中分别插入：
+
+```python
+emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="load")
+...
+emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="forward")
+...
+emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="backward")
+...
+emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="done", extra=f"loss=... lr=...")
+...
+emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="save")
+```
+
+同时把 `tqdm` 初始化改成：
+
+```python
+progress = tqdm(total=total_iters, desc="[JT-TRAIN]", ncols=100, mininterval=0.0, file=sys.stdout)
+```
+
+#### 这次修改带来的效果
+
+现在即使单个 iter 内部耗时较长，终端里也能更明确地看到脚本当前所处阶段：
+
+- `stage=load`
+- `stage=forward`
+- `stage=backward`
+- `stage=done`
+- `stage=save`
+
+这样就能更容易判断：
+
+- 是不是还在正常推进
+- 当前慢在数据准备、前向还是反向
+- 是否已经完成参数更新与 checkpoint 保存
+
 ### 14.17 最小训练中的 `doesn't have gradient` 警告说明
 
 用户继续观察到如下警告：

@@ -27,6 +27,15 @@ from jittor_impl.models.zoomnext_jt import frozen_bn_stats_jt
 from utils import io, ops
 
 
+def emit_progress(progress, *, epoch: int, curr_iter: int, stage: str, extra: str = "") -> None:
+    progress.set_description(f"[JT-TRAIN][E{epoch}]")
+    suffix = f"iter={curr_iter} stage={stage}"
+    if extra:
+        suffix = f"{suffix} {extra}"
+    progress.set_postfix_str(suffix)
+    progress.refresh()
+
+
 class ImageTrainDatasetJT:
     def __init__(self, dataset_infos: dict, shape: dict):
         self.shape = shape
@@ -272,21 +281,22 @@ def main() -> int:
     curr_iter = 0
 
     start_time = time.perf_counter()
-    progress = tqdm(total=total_iters, desc="[JT-TRAIN]", ncols=100)
+    progress = tqdm(total=total_iters, desc="[JT-TRAIN]", ncols=100, mininterval=0.0, file=sys.stdout)
     for epoch in range(num_epochs):
         model.train()
         maybe_freeze_bn_stats(model, cfg.train.bn.freeze_status, cfg.train.bn.freeze_affine)
 
         for batch_ids in batch_indices(len(dataset), batch_size, seed=args.seed + epoch, drop_last=True):
-            progress.set_description(f"[JT-TRAIN][E{epoch}]")
-            progress.set_postfix_str(f"iter={curr_iter}")
+            emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="load")
             samples = [dataset[idx] for idx in batch_ids]
             np_batch = collate_samples(samples)
             jt_batch = {key: jt.array(value) for key, value in np_batch.items()}
 
             iter_percentage = curr_iter / max(total_iters - 1, 1)
+            emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="forward")
             outputs = model(data=jt_batch, iter_percentage=iter_percentage)
             loss = outputs["loss"]
+            emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="backward")
             optimizer.step(loss)
 
             item = {
@@ -299,11 +309,18 @@ def main() -> int:
                 "shape": list(np_batch["mask"].shape),
             }
             progress.update(1)
-            progress.set_postfix_str(f"iter={curr_iter} loss={item['loss']:.5f} lr={item['lr_string']}")
+            emit_progress(
+                progress,
+                epoch=epoch,
+                curr_iter=curr_iter,
+                stage="done",
+                extra=f"loss={item['loss']:.5f} lr={item['lr_string']}",
+            )
             progress.write(json.dumps(item, ensure_ascii=False))
 
             curr_iter += 1
             if curr_iter % args.save_every == 0 or curr_iter == total_iters:
+                emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="save")
                 save_path = save_checkpoint(jt, model, checkpoint_dir, curr_iter)
                 progress.write(json.dumps({"checkpoint": str(save_path)}, ensure_ascii=False))
 
