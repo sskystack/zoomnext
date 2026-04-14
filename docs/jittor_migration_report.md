@@ -1286,3 +1286,74 @@ python3 scripts/validate_jittor_simple_aspp.py
 - 是否还出现大规模 `load parameter ... failed`
 - `max_abs_err` 是否下降到 `1e-5` 左右量级
 - `mean_abs_err` 是否下降到 `1e-6` 左右量级
+
+### 8.9 修复后的第二轮 `SimpleASPP` 验证结果
+
+你在 Ubuntu 容器中重新执行了：
+
+```bash
+python3 scripts/validate_jittor_simple_aspp.py
+```
+
+这次输出结果为：
+
+```json
+{
+  "name": "SimpleASPP",
+  "shape": [2, 8, 11, 13],
+  "max_abs_err": 4.470348358154297e-08,
+  "mean_abs_err": 4.8249488848739475e-09
+}
+```
+
+最终结论：
+
+```text
+Validation passed.
+```
+
+### 8.10 这次结果说明什么
+
+这次结果说明：
+
+1. `SimpleASPP` 的 PyTorch 权重已经能够正确加载到 Jittor 模型
+2. `SimpleASPP` 的 Jittor 实现与原 PyTorch 版在模块级数值上已经高度一致
+3. 之前那次失败的主要原因确实是参数键名不一致，而不是层的执行逻辑写错
+
+从误差量级看：
+
+- `max_abs_err = 4.47e-08`
+- `mean_abs_err = 4.82e-09`
+
+这已经明显优于我们原先给这个模块设定的阈值：
+
+- `tol-max = 1e-5`
+- `tol-mean = 1e-6`
+
+因此当前可以得出明确结论：
+
+> `SimpleASPP` 已完成等价迁移，并通过了 Ubuntu 容器中的 PyTorch/Jittor 模块级对照验证。
+
+### 8.11 当前阶段状态更新
+
+截至当前，已经完成并验证通过的部分有：
+
+- 基础算子层
+  - `resize_to`
+  - `rescale_2x`
+  - `PixelNormalizer`
+  - `LayerNorm2d`
+- 核心层中的 `SimpleASPP`
+
+仍未完成的模块：
+
+- `MHSIU`
+- `DifferenceAwareOps`
+- `RGPU`
+- `ResNet50 backbone`
+- `RN50_ZoomNeXt` 整体前向
+
+下一步建议：
+
+优先继续迁移 `MHSIU`。  
+原因是它依赖的基础模块已经就绪，而且比 `DifferenceAwareOps`、`RGPU` 更适合作为下一块独立验证对象。
