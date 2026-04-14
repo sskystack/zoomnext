@@ -5913,3 +5913,71 @@ num_frames = 1
 - 在 `num_frames == 1` 时，把这些时序参数从 optimizer 中排除
 
 但这属于日志和工程优化，不属于当前“等价迁移”必须修复的问题。
+
+### 14.19 最小训练 smoke test 首个 iter 输出
+
+用户在最小训练运行过程中拿到的首个 iter 输出如下：
+
+```json
+{"iter": 0, "epoch": 0, "lr": [1e-05, 0.0001], "lr_string": "1.000e-05,1.000e-04", "loss": 0.9702632427215576, "loss_str": "bce: 0.97026 powual_0.00000: 0.00000", "shape": [4, 1, 384, 384]}
+```
+
+#### 这条输出为什么是合理的
+
+这条输出整体是正确的，并且能说明训练入口已经完成了首个训练 step。
+
+逐项解释如下：
+
+1. `iter = 0`  
+   说明这是第一个训练 iter，符合当前 smoke test 的预期。
+
+2. `epoch = 0`  
+   说明当前还在第一个 epoch。
+
+3. `lr = [1e-05, 0.0001]`  
+   这与 `group_mode = "finetune"` 完全一致：
+   - pretrained 组使用 `diff_factor = 0.1`
+   - retrained 组使用基础学习率 `1e-4`
+
+4. `loss_str = "bce: 0.97026 powual_0.00000: 0.00000"`  
+   这也是合理的，因为在第一个 iter：
+
+   ```python
+   iter_percentage = curr_iter / max(total_iters - 1, 1)
+   ```
+
+   当 `curr_iter = 0` 时，`iter_percentage = 0`，所以：
+
+   - `ual_coef = 0`
+   - `UAL loss = 0`
+
+   因此第一步只剩 BCE loss，这是符合原始设计的。
+
+5. `shape = [4, 1, 384, 384]`  
+   这和当前配置文件 `configs/icod_train.py` 一致：
+   - batch size = 4
+   - mask shape = `1 x 384 x 384`
+
+6. `loss = 0.9702632427215576`  
+   这个数值本身没有异常，处在合理范围内。
+
+#### 这条输出说明了什么
+
+这说明当前最小训练链路已经至少完成了：
+
+- 数据加载
+- 多尺度输入构造
+- 模型前向
+- loss 计算
+- 反向传播
+- optimizer step
+- 训练日志输出
+
+也就是说，`train_jittor_rn50_zoomnext.py` 已经不只是“能启动”，而是已经完成了真实训练 step。
+
+#### 下一步还需要确认什么
+
+如果继续跑到 `--max-iters 2` 结束，还需要再确认两件事：
+
+1. 第 `1` 个 iter 是否也能正常完成
+2. 是否能打印 checkpoint 保存信息并正常退出
