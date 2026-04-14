@@ -2323,3 +2323,393 @@ Validation passed.
 
 优先迁移 `DifferenceAwareOps`。  
 原因是它是 `RGPU` 的内部依赖，先把时序差分模块独立迁完并验证，后面 `RGPU` 的迁移风险会小很多。
+
+## 10. 第四轮更新：迁移 `DifferenceAwareOps`
+
+这一轮开始正式迁移 `methods/zoomnext/layers.py` 中的第三个核心模块：`DifferenceAwareOps`。
+
+根据你的要求，这一轮优先采用 Jittor 的高层封装来实现：
+
+- `nn.LayerNorm`
+- `nn.Linear`
+- `nn.Conv2d`
+- `nn.Sequential`
+- `nn.Softmax`
+- `jt.linalg.einsum`
+
+只有时间维 `roll` 这一步仍使用显式切片拼接，因为这样最直接、最稳定。
+
+如果这版高层实现误差很小，就直接保留；如果误差过大，再退到手工低层实现逐步重写。
+
+### 10.1 本轮修改的文件
+
+- 修改 `jittor_impl/models/layers_jt.py`
+- 新增 `scripts/validate_jittor_difference_aware_ops.py`
+
+### 10.2 `jittor_impl/models/layers_jt.py` 最新完整代码
+
+```python
+"""Jittor counterparts for the common ZoomNeXt layers.
+
+This file is migrated progressively. Each layer is ported one by one and
+validated against the PyTorch reference before the next layer lands.
+"""
+
+from __future__ import annotations
+
+import math
+
+import jittor as jt
+from jittor import nn
+
+from .ops_jt import ConvBNReLU, adaptive_avg_pool2d_pt, adaptive_max_pool2d_pt, resize_to
+
+
+class SimpleASPP(nn.Module):
+    def __init__(self, in_dim, out_dim, dilation=3):
+        super().__init__()
+        self.out_dim = out_dim
+        self.conv1x1_1 = ConvBNReLU(in_dim, 2 * out_dim, 1)
+        self.conv1x1_2 = ConvBNReLU(out_dim, out_dim, 1)
+        self.conv3x3_1 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.conv3x3_2 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.conv3x3_3 = ConvBNReLU(out_dim, out_dim, 3, dilation=dilation, padding=dilation)
+        self.fuse = nn.Sequential(
+            ConvBNReLU(5 * out_dim, out_dim, 1),
+            ConvBNReLU(out_dim, out_dim, 3, 1, 1),
+        )
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        y = self.conv1x1_1(x)
+        y1 = y[:, : self.out_dim, :, :]
+        y5 = y[:, self.out_dim :, :, :]
+
+        y2 = self.conv3x3_1(y1)
+        y3 = self.conv3x3_2(y2)
+        y4 = self.conv3x3_3(y3)
+
+        y0 = y5.mean(dims=(2, 3), keepdims=True)
+        y0 = self.conv1x1_2(y0)
+        y0 = resize_to(y0, tgt_hw=x.shape[-2:])
+        return self.fuse(jt.concat([y0, y1, y2, y3, y4], dim=1))
+
+
+class DifferenceAwareOps(nn.Module):
+    def __init__(self, num_frames):
+        super().__init__()
+        self.num_frames = num_frames
+        self.temperal_proj_norm = nn.LayerNorm(num_frames, elementwise_affine=False)
+        self.temperal_proj_kv = nn.Linear(num_frames, 2 * num_frames, bias=False)
+
+        conv1 = nn.Conv2d(num_frames, num_frames, 3, 1, 1, bias=False)
+        relu = nn.ReLU()
+        conv2 = nn.Conv2d(num_frames, num_frames, 3, 1, 1, bias=False)
+        conv2.weight.assign(jt.zeros(conv2.weight.shape))
+
+        self.temperal_proj = nn.Sequential()
+        self.temperal_proj.add_module("0", conv1)
+        self.temperal_proj.add_module("1", relu)
+        self.temperal_proj.add_module("2", conv2)
+        self.softmax_y = nn.Softmax(dim=2)
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        if self.num_frames == 1:
+            return x
+
+        bt, c, h, w = x.shape
+        batch_size = bt // self.num_frames
+
+        unshifted_x_tmp = x.reshape((batch_size, self.num_frames, c, h, w))
+        unshifted_x_tmp = jt.permute(unshifted_x_tmp, 0, 2, 3, 4, 1)
+
+        shifted_x_tmp = jt.concat([unshifted_x_tmp[..., -1:], unshifted_x_tmp[..., :-1]], dim=-1)
+        diff_q = shifted_x_tmp - unshifted_x_tmp
+        diff_q = self.temperal_proj_norm(diff_q)
+
+        diff_kv = self.temperal_proj_kv(diff_q)
+        diff_k = diff_kv[..., : self.num_frames]
+        diff_v = diff_kv[..., self.num_frames :]
+
+        diff_qk = jt.linalg.einsum("bxhwt,byhwt->bxyt", diff_q, diff_k) * (h * w) ** -0.5
+        temperal_diff = jt.linalg.einsum("bxyt,byhwt->bxhwt", self.softmax_y(diff_qk), diff_v)
+
+        temperal_diff = jt.permute(temperal_diff, 0, 1, 4, 2, 3)
+        temperal_diff = temperal_diff.reshape((batch_size * c, self.num_frames, h, w))
+        shifted_x_tmp = self.temperal_proj(temperal_diff)
+        shifted_x_tmp = shifted_x_tmp.reshape((batch_size, c, self.num_frames, h, w))
+        shifted_x_tmp = jt.permute(shifted_x_tmp, 0, 2, 1, 3, 4)
+        shifted_x_tmp = shifted_x_tmp.reshape((bt, c, h, w))
+        return x + shifted_x_tmp
+
+
+class RGPU(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.args = args
+        self.kwargs = kwargs
+
+    def execute(self, x: jt.Var) -> jt.Var:
+        raise NotImplementedError("RGPU will be migrated in the next step.")
+
+
+class MHSIU(nn.Module):
+    def __init__(self, in_dim, num_groups=4):
+        super().__init__()
+        self.in_dim = in_dim
+        self.num_groups = num_groups
+        self.group_dim = in_dim // num_groups
+
+        self.conv_l_pre = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_s_pre = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+
+        self.conv_l = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_m = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+        self.conv_s = ConvBNReLU(in_dim, in_dim, 3, 1, 1)
+
+        self.conv_lms = ConvBNReLU(3 * in_dim, 3 * in_dim, 1)
+        self.initial_merge = ConvBNReLU(3 * in_dim, 3 * in_dim, 1)
+
+        self.trans = nn.Sequential(
+            ConvBNReLU(3 * self.group_dim, self.group_dim, 1),
+            ConvBNReLU(self.group_dim, self.group_dim, 3, 1, 1),
+            nn.Conv2d(self.group_dim, 3, 1),
+            nn.Softmax(dim=1),
+        )
+
+    def execute(self, l: jt.Var, m: jt.Var, s: jt.Var) -> jt.Var:
+        tgt_size = (int(m.shape[2]), int(m.shape[3]))
+
+        l = self.conv_l_pre(l)
+        l = adaptive_max_pool2d_pt(l, tgt_size) + adaptive_avg_pool2d_pt(l, tgt_size)
+        s = self.conv_s_pre(s)
+        s = resize_to(s, tgt_hw=tgt_size)
+
+        l = self.conv_l(l)
+        m = self.conv_m(m)
+        s = self.conv_s(s)
+        lms = jt.concat([l, m, s], dim=1)
+
+        attn = self.conv_lms(lms)
+        bt, _, h, w = attn.shape
+        attn = attn.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+        attn = jt.permute(attn, 0, 2, 1, 3, 4, 5)
+        attn = attn.reshape((bt * self.num_groups, 3 * self.group_dim, h, w))
+        attn = self.trans(attn)
+        attn = attn.unsqueeze(dim=2)
+
+        x = self.initial_merge(lms)
+        x = x.reshape((bt, 3, self.num_groups, self.group_dim, h, w))
+        x = jt.permute(x, 0, 2, 1, 3, 4, 5)
+        x = x.reshape((bt * self.num_groups, 3, self.group_dim, h, w))
+        x = (attn * x).sum(dim=1)
+        x = x.reshape((bt, self.num_groups, self.group_dim, h, w))
+        x = x.reshape((bt, self.num_groups * self.group_dim, h, w))
+        return x
+```
+
+解释：
+
+#### 为什么这轮优先用高层封装
+
+这是按你的要求来的。  
+`DifferenceAwareOps` 本身包含：
+
+- LayerNorm
+- 线性层
+- 卷积块
+- Softmax
+- 两次 `einsum`
+
+这些都属于 Jittor 已经提供高层接口的部分，所以优先先用高层版实现，看看能不能直接对齐。
+
+#### 时间维 `roll` 为什么还是自己写
+
+这一行：
+
+```python
+shifted_x_tmp = jt.concat([unshifted_x_tmp[..., -1:], unshifted_x_tmp[..., :-1]], dim=-1)
+```
+
+等价于原仓库的：
+
+```python
+shifted_x_tmp = torch.roll(unshifted_x_tmp, shifts=1, dims=-1)
+```
+
+这里用切片拼接不是“降级实现”，而是为了让行为更明确，也避免框架 `roll` 接口差异带来额外不确定性。
+
+#### 为什么保留 `einsum`
+
+原仓库中的两句核心就是：
+
+```python
+diff_qk = torch.einsum("bxhwt, byhwt -> bxyt", diff_q, diff_k) * (H * W) ** -0.5
+temperal_diff = torch.einsum("bxyt, byhwt -> bxhwt", diff_qk.softmax(dim=2), diff_v)
+```
+
+这里继续保留 `einsum`，是因为它最接近原始数学表达，能避免过早把逻辑改写成复杂 reshape + matmul，降低人为出错概率。
+
+#### 为什么保留末层卷积 zero init
+
+原仓库会把：
+
+```python
+self.temperal_proj[-1]
+```
+
+也就是第二个卷积层参数初始化为 0。  
+这一点在 Jittor 中也显式保留了：
+
+```python
+conv2.weight.assign(jt.zeros(conv2.weight.shape))
+```
+
+这样初始行为才能和 PyTorch 保持一致。
+
+### 10.3 `scripts/validate_jittor_difference_aware_ops.py` 完整代码
+
+```python
+#!/usr/bin/env python3
+"""Validate the migrated Jittor DifferenceAwareOps against the PyTorch reference."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import random
+import sys
+
+import numpy as np
+import torch
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from methods.zoomnext.layers import DifferenceAwareOps as TorchDifferenceAwareOps
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate Jittor DifferenceAwareOps against PyTorch.")
+    parser.add_argument("--seed", type=int, default=20260414)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-frames", type=int, default=5)
+    parser.add_argument("--channels", type=int, default=16)
+    parser.add_argument("--height", type=int, default=11)
+    parser.add_argument("--width", type=int, default=13)
+    parser.add_argument("--tol-max", type=float, default=1e-5)
+    parser.add_argument("--tol-mean", type=float, default=1e-6)
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def compare_arrays(name: str, pt_value: torch.Tensor, jt_value: np.ndarray) -> dict:
+    pt_arr = pt_value.detach().cpu().numpy().astype(np.float32)
+    jt_arr = np.asarray(jt_value, dtype=np.float32)
+    abs_err = np.abs(pt_arr - jt_arr)
+    return {
+        "name": name,
+        "shape": list(pt_arr.shape),
+        "max_abs_err": float(abs_err.max()),
+        "mean_abs_err": float(abs_err.mean()),
+    }
+
+
+def torch_state_dict_to_numpy(state_dict: dict) -> dict:
+    return {name: value.detach().cpu().numpy() for name, value in state_dict.items()}
+
+
+def main() -> int:
+    args = parse_args()
+    set_seed(args.seed)
+
+    try:
+        import jittor as jt
+    except ImportError as exc:
+        raise SystemExit(
+            "Jittor is not installed. Please install Jittor in the container before running this script."
+        ) from exc
+
+    from jittor_impl.models.layers_jt import DifferenceAwareOps as JittorDifferenceAwareOps
+
+    jt.flags.use_cuda = 0
+
+    x_np = np.random.randn(
+        args.batch_size * args.num_frames,
+        args.channels,
+        args.height,
+        args.width,
+    ).astype(np.float32)
+    x_pt = torch.from_numpy(x_np)
+    x_jt = jt.array(x_np)
+
+    pt_model = TorchDifferenceAwareOps(args.num_frames)
+    pt_model.eval()
+
+    jt_model = JittorDifferenceAwareOps(args.num_frames)
+    jt_model.eval()
+    jt_model.load_state_dict(torch_state_dict_to_numpy(pt_model.state_dict()))
+
+    with torch.no_grad():
+        pt_output = pt_model(x_pt)
+    jt_output = jt_model(x_jt).numpy()
+
+    report = compare_arrays("DifferenceAwareOps", pt_output, jt_output)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+    if report["max_abs_err"] > args.tol_max or report["mean_abs_err"] > args.tol_mean:
+        print(
+            "\nValidation failed: "
+            f"max_abs_err={report['max_abs_err']:.6e}, mean_abs_err={report['mean_abs_err']:.6e}"
+        )
+        return 1
+
+    print("\nValidation passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+解释：
+
+这个脚本和之前 `SimpleASPP`、`MHSIU` 的验证方式一致：
+
+- 固定随机种子
+- 构造同一份输入
+- 用 PyTorch 权重初始化 Jittor 版模块
+- 两边都切到 `eval` 模式
+- 比较最终输出误差
+
+### 10.4 本轮验证命令
+
+Ubuntu 容器里直接运行：
+
+```bash
+python3 scripts/validate_jittor_difference_aware_ops.py
+```
+
+如果需要显式指定路径环境，也可以写成：
+
+```bash
+PYTHONPATH=. python3 scripts/validate_jittor_difference_aware_ops.py
+```
+
+### 10.5 当前阶段结论更新
+
+当前进度更新为：
+
+- 基础算子层已完成并验证通过
+- `SimpleASPP` 已完成并验证通过
+- `MHSIU` 已完成并验证通过
+- `DifferenceAwareOps` 已完成第一版高层实现
+- `DifferenceAwareOps` 验证脚本已新增
+
+但目前还没有收到 `DifferenceAwareOps` 的容器验证结果，因此它还不能算“已验证通过”。
