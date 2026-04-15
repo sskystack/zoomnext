@@ -297,3 +297,27 @@ class SchedulerJT:
         if save_path:
             fig.savefig(os.path.join(save_path, "lr_coef.png"))
         plt.close()
+
+    def state_dict(self):
+        return {
+            "num_iters": self.num_iters,
+            "epoch_length": self.epoch_length,
+            "step_by_batch": self.step_by_batch,
+            "scheduler_cfg": copy.deepcopy(self.scheduler_cfg),
+            "mode": self.mode,
+            "num_warmup_iters": self.num_warmup_iters,
+            "num_scheduler_iters": self.num_scheduler_iters,
+            "last_lr_coef": self.last_lr_coef,
+            "initial_lrs": None if self.initial_lrs is None else list(self.initial_lrs),
+        }
+
+    def load_state_dict(self, state_dict):
+        self.num_iters = state_dict.get("num_iters", self.num_iters)
+        self.epoch_length = state_dict.get("epoch_length", self.epoch_length)
+        self.step_by_batch = state_dict.get("step_by_batch", self.step_by_batch)
+        self.scheduler_cfg = copy.deepcopy(state_dict.get("scheduler_cfg", self.scheduler_cfg))
+        self.mode = state_dict.get("mode", self.mode)
+        self.num_warmup_iters = state_dict.get("num_warmup_iters", self.num_warmup_iters)
+        self.num_scheduler_iters = state_dict.get("num_scheduler_iters", self.num_scheduler_iters)
+        self.last_lr_coef = state_dict.get("last_lr_coef", self.last_lr_coef)
+        self.initial_lrs = state_dict.get("initial_lrs", self.initial_lrs)

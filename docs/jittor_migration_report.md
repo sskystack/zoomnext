@@ -7702,3 +7702,335 @@ with scaler.autocast():
 - 是否要补 TensorBoard 类似能力
 
 但从训练框架主线来看，这一轮已经把此前明确缺失的两块核心能力补上了。
+
+## 20. 补齐完整训练状态 checkpoint、TensorBoard 与训练可视化
+
+这一轮继续补齐训练框架剩余的两个明显缺口：
+
+- checkpoint 还不是完整训练状态保存
+- TensorBoard 与训练过程可视化还没有接入
+
+这一轮对应的修改文件有：
+
+- `scripts/train_jittor_rn50_zoomnext.py`
+- `scripts/test_jittor_rn50_zoomnext.py`
+- `jittor_impl/pipeline/scheduler_jt.py`
+
+### 20.1 `scheduler_jt.py` 增加 `state_dict/load_state_dict`
+
+新增代码：
+
+```python
+    def state_dict(self):
+        return {
+            "num_iters": self.num_iters,
+            "epoch_length": self.epoch_length,
+            "step_by_batch": self.step_by_batch,
+            "scheduler_cfg": copy.deepcopy(self.scheduler_cfg),
+            "mode": self.mode,
+            "num_warmup_iters": self.num_warmup_iters,
+            "num_scheduler_iters": self.num_scheduler_iters,
+            "last_lr_coef": self.last_lr_coef,
+            "initial_lrs": None if self.initial_lrs is None else list(self.initial_lrs),
+        }
+
+    def load_state_dict(self, state_dict):
+        self.num_iters = state_dict.get("num_iters", self.num_iters)
+        self.epoch_length = state_dict.get("epoch_length", self.epoch_length)
+        self.step_by_batch = state_dict.get("step_by_batch", self.step_by_batch)
+        self.scheduler_cfg = copy.deepcopy(state_dict.get("scheduler_cfg", self.scheduler_cfg))
+        self.mode = state_dict.get("mode", self.mode)
+        self.num_warmup_iters = state_dict.get("num_warmup_iters", self.num_warmup_iters)
+        self.num_scheduler_iters = state_dict.get("num_scheduler_iters", self.num_scheduler_iters)
+        self.last_lr_coef = state_dict.get("last_lr_coef", self.last_lr_coef)
+        self.initial_lrs = state_dict.get("initial_lrs", self.initial_lrs)
+```
+
+解释：
+
+这一步是为了让 scheduler 也能进入完整 checkpoint。  
+如果没有 `state_dict/load_state_dict`，即使模型和 optimizer 恢复了，scheduler 也还是会从初始状态重新开始，和真实断点续训不一致。
+
+### 20.2 `train_jittor_rn50_zoomnext.py` 增加完整 checkpoint 保存与恢复
+
+关键新增代码如下。
+
+```python
+def _maybe_state_dict(obj):
+    if obj is None or not hasattr(obj, "state_dict"):
+        return None
+    return obj.state_dict()
+
+
+def _extract_model_state(payload):
+    if isinstance(payload, dict) and "model" in payload:
+        return payload["model"]
+    return payload
+
+
+def build_checkpoint_payload(model, optimizer, scheduler, scaler, *, curr_iter: int, curr_epoch: int):
+    return {
+        "checkpoint_type": "jittor_train_state_v1",
+        "model": model.state_dict(),
+        "optimizer": _maybe_state_dict(optimizer),
+        "scheduler": _maybe_state_dict(scheduler),
+        "scaler": _maybe_state_dict(scaler),
+        "curr_iter": int(curr_iter),
+        "curr_epoch": int(curr_epoch),
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+    }
+
+
+def save_checkpoint(jt, model, optimizer, scheduler, scaler, save_dir: Path, step: int, epoch: int):
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / f"step_{step:06d}.pkl"
+    payload = build_checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        curr_iter=step,
+        curr_epoch=epoch,
+    )
+    jt.save(payload, str(save_path))
+    return save_path
+
+
+def load_training_state(jt, model, optimizer, scheduler, scaler, load_path: str) -> dict:
+    payload = jt.load(load_path)
+    model.load_state_dict(_extract_model_state(payload))
+    if not (isinstance(payload, dict) and "model" in payload):
+        return {"curr_iter": 0, "curr_epoch": 0, "format": "model_only"}
+
+    if payload.get("optimizer") is not None and hasattr(optimizer, "load_state_dict"):
+        optimizer.load_state_dict(payload["optimizer"])
+    if payload.get("scheduler") is not None and hasattr(scheduler, "load_state_dict"):
+        scheduler.load_state_dict(payload["scheduler"])
+    if payload.get("scaler") is not None and hasattr(scaler, "load_state_dict"):
+        scaler.load_state_dict(payload["scaler"])
+    if payload.get("python_random_state") is not None:
+        random.setstate(payload["python_random_state"])
+    if payload.get("numpy_random_state") is not None:
+        np.random.set_state(payload["numpy_random_state"])
+    return {
+        "curr_iter": int(payload.get("curr_iter", 0)),
+        "curr_epoch": int(payload.get("curr_epoch", 0)),
+        "format": payload.get("checkpoint_type", "jittor_train_state_v1"),
+    }
+```
+
+解释：
+
+这一段把 checkpoint 从“只存模型参数”升级成了“训练状态包”。  
+现在一次 checkpoint 会同时保存：
+
+- `model`
+- `optimizer`
+- `scheduler`
+- `scaler`
+- `curr_iter`
+- `curr_epoch`
+- Python 随机数状态
+- NumPy 随机数状态
+
+这样后续用 `--resume-from` 恢复时，不再只是“载入权重继续跑”，而是更接近真正的断点续训。
+
+### 20.3 训练主循环补上 resume 逻辑
+
+新增代码：
+
+```python
+    resume_state = {"curr_iter": 0, "curr_epoch": 0, "format": None}
+    if args.resume_from:
+        resume_state = load_training_state(
+            jt=jt,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            load_path=args.resume_from,
+        )
+        append_text_log(run_paths["log"], json.dumps({"resume_state": resume_state}, ensure_ascii=False))
+    curr_iter = resume_state["curr_iter"]
+    if curr_iter >= total_iters:
+        raise SystemExit(f"resume checkpoint iter {curr_iter} has already reached total_iters {total_iters}.")
+    start_epoch = curr_iter // epoch_length
+```
+
+```python
+    progress = tqdm(
+        total=total_iters,
+        initial=curr_iter,
+        desc="[JT-TRAIN]",
+        ncols=100,
+        mininterval=0.0,
+        file=sys.stdout,
+    )
+```
+
+```python
+        epoch_batches = list(batch_indices(len(dataset), batch_size, seed=args.seed + epoch, drop_last=True))
+        skip_batches = curr_iter % epoch_length if epoch == start_epoch else 0
+        for batch_idx, batch_ids in enumerate(epoch_batches):
+            if batch_idx < skip_batches:
+                continue
+```
+
+解释：
+
+这里做了三件事：
+
+1. 从 checkpoint 恢复 `curr_iter`
+2. 让进度条从恢复位置继续显示
+3. 对恢复时所在 epoch 的前面 batch 做跳过
+
+因为当前数据打乱顺序本来就是按 `seed + epoch` 确定的，所以恢复时只要重新生成同一 epoch 的 batch 顺序，再跳过已经做完的那些 batch，就能保持训练路径一致。
+
+### 20.4 接入 TensorBoard 日志
+
+新增代码：
+
+```python
+    tb_logger = recorder.TBLogger(tb_root=str(run_paths["tb"]))
+    loss_recorder = recorder.HistoryBuffer()
+```
+
+```python
+            loss_value = float(loss.numpy())
+            data_shape = list(np_batch["mask"].shape)
+            loss_recorder.update(value=loss_value, num=data_shape[0])
+            item = {
+                "iter": curr_iter,
+                "epoch": epoch,
+                "lr": lr_groups(optimizer),
+                "lr_string": lr_string(optimizer),
+                "loss": loss_value,
+                "avg_loss": loss_recorder.global_avg,
+                "loss_str": outputs["loss_str"],
+                "shape": data_shape,
+            }
+```
+
+```python
+            tb_logger.write_to_tb("lr", item["lr"], curr_iter)
+            tb_logger.write_to_tb("iter_loss", item["loss"], curr_iter)
+            tb_logger.write_to_tb("avg_loss", item["avg_loss"], curr_iter)
+```
+
+```python
+    tb_logger.close_tb()
+```
+
+解释：
+
+这一轮把主干里的 `TBLogger` 正式接进来了。  
+现在训练过程中会向 TensorBoard 写入：
+
+- `lr`
+- `iter_loss`
+- `avg_loss`
+
+也就是说，Jittor 侧不再只有 JSONL 和文本日志，而是开始具备和主干一致风格的 TB 标量记录能力。
+
+### 20.5 接入训练拼图可视化
+
+新增代码：
+
+```python
+def build_visual_container(np_batch: dict[str, np.ndarray], outputs: dict) -> dict | None:
+    try:
+        import torch
+    except ImportError:
+        warnings.warn("torch is not installed, skip training visualization plotting.")
+        return None
+
+    visual_data = {
+        "img": torch.from_numpy(np_batch["image_m"].astype(np.float32)),
+        "msk": torch.from_numpy(np_batch["mask"].astype(np.float32)),
+    }
+    for key, value in outputs.get("vis", {}).items():
+        array = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+        visual_data[key] = torch.from_numpy(array.astype(np.float32))
+    return visual_data
+
+
+def maybe_plot_results(visual_data: dict | None, save_path: Path):
+    if visual_data is None:
+        return
+    recorder.plot_results(visual_data, save_path=str(save_path))
+```
+
+```python
+            last_visual_data = build_visual_container(np_batch=np_batch, outputs=outputs)
+            if curr_iter < 3:
+                maybe_plot_results(last_visual_data, run_paths["run_dir"] / "img" / f"iter_{curr_iter}.png")
+```
+
+```python
+        if last_visual_data is not None:
+            maybe_plot_results(last_visual_data, run_paths["run_dir"] / "img" / f"epoch_{epoch}.png")
+```
+
+解释：
+
+这一轮没有重写一套新的拼图绘制器，而是复用了原仓库的 `recorder.plot_results()`。
+
+做法是：
+
+- 把当前 batch 的 `image_m`
+- 当前 batch 的 `mask`
+- 当前输出里的 `vis`
+
+统一转成 `torch.Tensor`，然后交给原始拼图函数生成结果图。
+
+这样可以保留和主干一致的可视化风格，同时不需要重复发明一套绘图逻辑。
+
+### 20.6 评测脚本兼容新 checkpoint 格式
+
+`scripts/test_jittor_rn50_zoomnext.py` 增加了这段代码：
+
+```python
+def extract_model_state(payload):
+    if isinstance(payload, dict) and "model" in payload:
+        return payload["model"]
+    return payload
+```
+
+并把：
+
+```python
+model.load_state_dict(jt.load(args.load_from))
+```
+
+改成了：
+
+```python
+model.load_state_dict(extract_model_state(jt.load(args.load_from)))
+```
+
+解释：
+
+这是因为从这一轮开始，训练脚本保存出来的 checkpoint 不再只是单纯的 `model.state_dict()`，而是完整训练状态字典。
+
+如果评测脚本不做兼容处理，后面你训练完再测试时，就会因为 checkpoint 格式变化而无法直接加载。
+
+### 20.7 这一轮完成后意味着什么
+
+到这一步，Jittor 版 `resnet50` 路线的训练框架又向主干靠近了一大步。
+
+现在已经具备：
+
+- 完整训练状态 checkpoint
+- `--resume-from` 断点续训
+- scheduler/scaler 状态恢复
+- TensorBoard 标量日志
+- 训练 batch 拼图可视化
+- 新旧 checkpoint 格式兼容评测
+
+因此，这一轮完成后，之前你指出的这两个缺口：
+
+- “checkpoint 还不是完整训练状态保存”
+- “TensorBoard 和训练可视化还没有”
+
+都已经补上了。

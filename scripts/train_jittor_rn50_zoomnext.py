@@ -10,6 +10,7 @@ import random
 import shutil
 import sys
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -27,7 +28,7 @@ if str(REPO_ROOT) not in sys.path:
 from jittor_impl.models import RN50_ZoomNeXt_JT
 from jittor_impl.models.zoomnext_jt import frozen_bn_stats_jt
 from jittor_impl.pipeline import ScalerJT, SchedulerJT
-from utils import io, ops, py_utils
+from utils import io, ops, py_utils, recorder
 
 
 def emit_progress(progress, *, epoch: int, curr_iter: int, stage: str, extra: str = "") -> None:
@@ -57,6 +58,8 @@ def prepare_run_dirs(args: argparse.Namespace, cfg) -> dict[str, Path]:
     run_dir = Path(path_cfg["pth_log"])
     checkpoints_dir = Path(path_cfg["pth"])
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    tb_dir = Path(path_cfg["tb"])
+    tb_dir.mkdir(parents=True, exist_ok=True)
 
     config_copy_path = Path(path_cfg["cfg_copy"])
     trainer_copy_path = Path(path_cfg["trainer_copy"])
@@ -96,6 +99,7 @@ def prepare_run_dirs(args: argparse.Namespace, cfg) -> dict[str, Path]:
     return {
         "run_dir": run_dir,
         "checkpoints_dir": checkpoints_dir,
+        "tb": tb_dir,
         "config_copy": config_copy_path,
         "trainer_copy": trainer_copy_path,
         "log": log_path,
@@ -303,11 +307,91 @@ def maybe_freeze_bn_stats(model, freeze_status: bool, freeze_affine: bool):
         frozen_bn_stats_jt(model.encoder, freeze_affine=freeze_affine)
 
 
-def save_checkpoint(jt, model, save_dir: Path, step: int):
+def _maybe_state_dict(obj):
+    if obj is None or not hasattr(obj, "state_dict"):
+        return None
+    return obj.state_dict()
+
+
+def _extract_model_state(payload):
+    if isinstance(payload, dict) and "model" in payload:
+        return payload["model"]
+    return payload
+
+
+def build_checkpoint_payload(model, optimizer, scheduler, scaler, *, curr_iter: int, curr_epoch: int):
+    return {
+        "checkpoint_type": "jittor_train_state_v1",
+        "model": model.state_dict(),
+        "optimizer": _maybe_state_dict(optimizer),
+        "scheduler": _maybe_state_dict(scheduler),
+        "scaler": _maybe_state_dict(scaler),
+        "curr_iter": int(curr_iter),
+        "curr_epoch": int(curr_epoch),
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+    }
+
+
+def save_checkpoint(jt, model, optimizer, scheduler, scaler, save_dir: Path, step: int, epoch: int):
     save_dir.mkdir(parents=True, exist_ok=True)
     save_path = save_dir / f"step_{step:06d}.pkl"
-    jt.save(model.state_dict(), str(save_path))
+    payload = build_checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        curr_iter=step,
+        curr_epoch=epoch,
+    )
+    jt.save(payload, str(save_path))
     return save_path
+
+
+def load_training_state(jt, model, optimizer, scheduler, scaler, load_path: str) -> dict:
+    payload = jt.load(load_path)
+    model.load_state_dict(_extract_model_state(payload))
+    if not (isinstance(payload, dict) and "model" in payload):
+        return {"curr_iter": 0, "curr_epoch": 0, "format": "model_only"}
+
+    if payload.get("optimizer") is not None and hasattr(optimizer, "load_state_dict"):
+        optimizer.load_state_dict(payload["optimizer"])
+    if payload.get("scheduler") is not None and hasattr(scheduler, "load_state_dict"):
+        scheduler.load_state_dict(payload["scheduler"])
+    if payload.get("scaler") is not None and hasattr(scaler, "load_state_dict"):
+        scaler.load_state_dict(payload["scaler"])
+    if payload.get("python_random_state") is not None:
+        random.setstate(payload["python_random_state"])
+    if payload.get("numpy_random_state") is not None:
+        np.random.set_state(payload["numpy_random_state"])
+    return {
+        "curr_iter": int(payload.get("curr_iter", 0)),
+        "curr_epoch": int(payload.get("curr_epoch", 0)),
+        "format": payload.get("checkpoint_type", "jittor_train_state_v1"),
+    }
+
+
+def build_visual_container(np_batch: dict[str, np.ndarray], outputs: dict) -> dict | None:
+    try:
+        import torch
+    except ImportError:
+        warnings.warn("torch is not installed, skip training visualization plotting.")
+        return None
+
+    visual_data = {
+        "img": torch.from_numpy(np_batch["image_m"].astype(np.float32)),
+        "msk": torch.from_numpy(np_batch["mask"].astype(np.float32)),
+    }
+    for key, value in outputs.get("vis", {}).items():
+        array = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+        visual_data[key] = torch.from_numpy(array.astype(np.float32))
+    return visual_data
+
+
+def maybe_plot_results(visual_data: dict | None, save_path: Path):
+    if visual_data is None:
+        return
+    recorder.plot_results(visual_data, save_path=str(save_path))
 
 
 def construct_scheduler_jt(optimizer, total_iters: int, epoch_length: int, train_cfg):
@@ -363,8 +447,6 @@ def main() -> int:
         hmu_groups=6,
         weight_path=args.encoder_weight_path,
     )
-    if args.resume_from:
-        model.load_state_dict(jt.load(args.resume_from))
     model.train()
 
     maybe_freeze_encoder(model, cfg.train.bn.freeze_encoder)
@@ -390,17 +472,47 @@ def main() -> int:
     scheduler.plot_lr_coef_curve(save_path=str(run_paths["run_dir"]))
     scaler = construct_scaler_jt(jt=jt, optimizer=optimizer, train_cfg=cfg.train)
     grad_acc_step = max(1, int(cfg.train.grad_acc_step))
-    curr_iter = 0
+    resume_state = {"curr_iter": 0, "curr_epoch": 0, "format": None}
+    if args.resume_from:
+        resume_state = load_training_state(
+            jt=jt,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            load_path=args.resume_from,
+        )
+        append_text_log(run_paths["log"], json.dumps({"resume_state": resume_state}, ensure_ascii=False))
+    curr_iter = resume_state["curr_iter"]
+    if curr_iter >= total_iters:
+        raise SystemExit(f"resume checkpoint iter {curr_iter} has already reached total_iters {total_iters}.")
+    start_epoch = curr_iter // epoch_length
 
     start_time = time.perf_counter()
-    progress = tqdm(total=total_iters, desc="[JT-TRAIN]", ncols=100, mininterval=0.0, file=sys.stdout)
+    progress = tqdm(
+        total=total_iters,
+        initial=curr_iter,
+        desc="[JT-TRAIN]",
+        ncols=100,
+        mininterval=0.0,
+        file=sys.stdout,
+    )
     append_text_log(run_paths["log"], str(scheduler))
     optimizer.zero_grad()
-    for epoch in range(num_epochs):
+    tb_logger = recorder.TBLogger(tb_root=str(run_paths["tb"]))
+    loss_recorder = recorder.HistoryBuffer()
+    last_visual_data = None
+    last_epoch = start_epoch
+    for epoch in range(start_epoch, num_epochs):
+        last_epoch = epoch
         model.train()
         maybe_freeze_bn_stats(model, cfg.train.bn.freeze_status, cfg.train.bn.freeze_affine)
 
-        for batch_ids in batch_indices(len(dataset), batch_size, seed=args.seed + epoch, drop_last=True):
+        epoch_batches = list(batch_indices(len(dataset), batch_size, seed=args.seed + epoch, drop_last=True))
+        skip_batches = curr_iter % epoch_length if epoch == start_epoch else 0
+        for batch_idx, batch_ids in enumerate(epoch_batches):
+            if batch_idx < skip_batches:
+                continue
             emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="load")
             samples = [dataset[idx] for idx in batch_ids]
             np_batch = collate_samples(samples)
@@ -418,14 +530,18 @@ def main() -> int:
             if (curr_iter + 1) % grad_acc_step == 0 or curr_iter == total_iters - 1:
                 scaler.update_grad()
 
+            loss_value = float(loss.numpy())
+            data_shape = list(np_batch["mask"].shape)
+            loss_recorder.update(value=loss_value, num=data_shape[0])
             item = {
                 "iter": curr_iter,
                 "epoch": epoch,
                 "lr": lr_groups(optimizer),
                 "lr_string": lr_string(optimizer),
-                "loss": float(loss.numpy()),
+                "loss": loss_value,
+                "avg_loss": loss_recorder.global_avg,
                 "loss_str": outputs["loss_str"],
-                "shape": list(np_batch["mask"].shape),
+                "shape": data_shape,
             }
             progress.update(1)
             emit_progress(
@@ -438,11 +554,26 @@ def main() -> int:
             progress.write(json.dumps(item, ensure_ascii=False))
             append_jsonl(run_paths["iter_log"], item)
             append_text_log(run_paths["log"], json.dumps(item, ensure_ascii=False))
+            tb_logger.write_to_tb("lr", item["lr"], curr_iter)
+            tb_logger.write_to_tb("iter_loss", item["loss"], curr_iter)
+            tb_logger.write_to_tb("avg_loss", item["avg_loss"], curr_iter)
+            last_visual_data = build_visual_container(np_batch=np_batch, outputs=outputs)
+            if curr_iter < 3:
+                maybe_plot_results(last_visual_data, run_paths["run_dir"] / "img" / f"iter_{curr_iter}.png")
 
             curr_iter += 1
             if curr_iter % args.save_every == 0 or curr_iter == total_iters:
                 emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="save")
-                save_path = save_checkpoint(jt, model, checkpoint_dir, curr_iter)
+                save_path = save_checkpoint(
+                    jt,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    checkpoint_dir,
+                    curr_iter,
+                    epoch,
+                )
                 ckpt_item = {"checkpoint": str(save_path), "iter": curr_iter, "epoch": epoch}
                 progress.write(json.dumps(ckpt_item, ensure_ascii=False))
                 append_jsonl(run_paths["ckpt_log"], ckpt_item)
@@ -450,16 +581,19 @@ def main() -> int:
 
             if curr_iter >= total_iters:
                 break
+        if last_visual_data is not None:
+            maybe_plot_results(last_visual_data, run_paths["run_dir"] / "img" / f"epoch_{epoch}.png")
         if curr_iter >= total_iters:
             break
 
     progress.close()
-    final_path = save_checkpoint(jt, model, checkpoint_dir, curr_iter)
+    final_path = save_checkpoint(jt, model, optimizer, scheduler, scaler, checkpoint_dir, curr_iter, last_epoch)
     elapsed = time.perf_counter() - start_time
     final_item = {"final_checkpoint": str(final_path), "elapsed_sec": elapsed, "iters": curr_iter}
     print(json.dumps(final_item, ensure_ascii=False))
     append_jsonl(run_paths["ckpt_log"], final_item)
     append_text_log(run_paths["log"], json.dumps(final_item, ensure_ascii=False))
+    tb_logger.close_tb()
     return 0
 
 

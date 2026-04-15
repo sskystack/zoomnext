@@ -30,6 +30,12 @@ def append_text_log(path: Path, text: str) -> None:
         f.write(text + "\n")
 
 
+def extract_model_state(payload):
+    if isinstance(payload, dict) and "model" in payload:
+        return payload["model"]
+    return payload
+
+
 def prepare_eval_dirs(args: argparse.Namespace, cfg) -> dict[str, Path]:
     exp_name = py_utils.construct_exp_name(model_name="RN50_ZoomNeXt_JT_EVAL", cfg=cfg)
     path_cfg = py_utils.construct_path(output_dir=args.output_dir, exp_name=exp_name)
@@ -235,7 +241,7 @@ def main() -> int:
         hmu_groups=6,
         weight_path=args.encoder_weight_path,
     )
-    model.load_state_dict(jt.load(args.load_from))
+    model.load_state_dict(extract_model_state(jt.load(args.load_from)))
     model.eval()
 
     all_results = {}
