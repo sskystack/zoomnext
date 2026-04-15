@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from jittor_impl.models import RN50_ZoomNeXt_JT
 from jittor_impl.models.zoomnext_jt import frozen_bn_stats_jt
+from jittor_impl.pipeline import ScalerJT, SchedulerJT
 from utils import io, ops, py_utils
 
 
@@ -76,6 +77,10 @@ def prepare_run_dirs(args: argparse.Namespace, cfg) -> dict[str, Path]:
         "effective_batch_size": int(cfg.train.batch_size),
         "effective_num_epochs": int(cfg.train.num_epochs),
         "effective_lr": float(cfg.train.lr),
+        "effective_grad_acc_step": int(cfg.train.grad_acc_step),
+        "effective_use_amp": bool(cfg.train.use_amp),
+        "effective_sche_usebatch": bool(cfg.train.sche_usebatch),
+        "effective_scheduler": cfg.train.scheduler,
         "pretrained": args.pretrained,
         "encoder_weight_path": args.encoder_weight_path,
         "resume_from": args.resume_from,
@@ -305,6 +310,32 @@ def save_checkpoint(jt, model, save_dir: Path, step: int):
     return save_path
 
 
+def construct_scheduler_jt(optimizer, total_iters: int, epoch_length: int, train_cfg):
+    scheduler = SchedulerJT(
+        optimizer=optimizer,
+        num_iters=total_iters,
+        epoch_length=epoch_length,
+        scheduler_cfg=train_cfg.scheduler,
+        step_by_batch=train_cfg.sche_usebatch,
+    )
+    scheduler.record_lrs(param_groups=optimizer.param_groups)
+    return scheduler
+
+
+def construct_scaler_jt(jt, optimizer, train_cfg):
+    optimizer_cfg = train_cfg.optimizer
+    return ScalerJT(
+        jt=jt,
+        optimizer=optimizer,
+        use_fp16=bool(train_cfg.use_amp),
+        set_to_none=bool(optimizer_cfg.get("set_to_none", False)),
+        clip_grad=bool(optimizer_cfg.get("clip_grad", False)),
+        clip_mode=optimizer_cfg.get("clip_mode"),
+        clip_cfg=optimizer_cfg.get("clip_cfg"),
+        amp_level=int(train_cfg.get("amp_level", 5)),
+    )
+
+
 def main() -> int:
     args = parse_args()
     set_seed(args.seed)
@@ -351,11 +382,20 @@ def main() -> int:
 
     batch_size = int(cfg.train.batch_size)
     num_epochs = int(cfg.train.num_epochs)
-    total_iters = args.max_iters or (num_epochs * max(1, len(dataset) // batch_size))
+    epoch_length = max(1, len(dataset) // batch_size)
+    total_iters = args.max_iters or (num_epochs * epoch_length)
+    if args.max_iters is not None:
+        num_epochs = max(num_epochs, (total_iters + epoch_length - 1) // epoch_length)
+    scheduler = construct_scheduler_jt(optimizer=optimizer, total_iters=total_iters, epoch_length=epoch_length, train_cfg=cfg.train)
+    scheduler.plot_lr_coef_curve(save_path=str(run_paths["run_dir"]))
+    scaler = construct_scaler_jt(jt=jt, optimizer=optimizer, train_cfg=cfg.train)
+    grad_acc_step = max(1, int(cfg.train.grad_acc_step))
     curr_iter = 0
 
     start_time = time.perf_counter()
     progress = tqdm(total=total_iters, desc="[JT-TRAIN]", ncols=100, mininterval=0.0, file=sys.stdout)
+    append_text_log(run_paths["log"], str(scheduler))
+    optimizer.zero_grad()
     for epoch in range(num_epochs):
         model.train()
         maybe_freeze_bn_stats(model, cfg.train.bn.freeze_status, cfg.train.bn.freeze_affine)
@@ -367,11 +407,16 @@ def main() -> int:
             jt_batch = {key: jt.array(value) for key, value in np_batch.items()}
 
             iter_percentage = curr_iter / max(total_iters - 1, 1)
+            scheduler.step(curr_iter)
             emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="forward")
-            outputs = model(data=jt_batch, iter_percentage=iter_percentage)
+            with scaler.autocast():
+                outputs = model(data=jt_batch, iter_percentage=iter_percentage)
             loss = outputs["loss"]
+            loss = loss / grad_acc_step
             emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="backward")
-            optimizer.step(loss)
+            scaler.calculate_grad(loss)
+            if (curr_iter + 1) % grad_acc_step == 0 or curr_iter == total_iters - 1:
+                scaler.update_grad()
 
             item = {
                 "iter": curr_iter,

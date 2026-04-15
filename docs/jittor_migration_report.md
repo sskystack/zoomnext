@@ -7044,3 +7044,661 @@ python3 scripts/summarize_jittor_eval_results.py \
 - 结果汇总导出
 
 也就是说，后面你可以直接进入“正式训练 -> 正式评测 -> 汇总结果”的实验阶段，而不再只是做模块级迁移验证。
+
+## 19. 补齐 Jittor 训练框架中的 Scheduler 与 Scaler
+
+这一轮针对训练框架里还缺失的两块关键能力做了补齐：
+
+- 学习率调度器 `Scheduler`
+- 自动混精/梯度管理封装 `Scaler`
+
+在这之前，Jittor 训练入口虽然已经能完成真实训练 step，但和主干 PyTorch 训练框架相比，还存在两个明显差异：
+
+1. 学习率基本是固定的，没有接入主干里的 warmup 和 scheduler 框架
+2. 训练过程是直接 `optimizer.step(loss)`，没有主干那种 `Scaler/autocast/grad clip/grad accumulation` 风格的统一训练入口
+
+因此这一轮的目标，是把这两块训练工程能力补到 Jittor 版本里。
+
+新增文件：
+
+- `jittor_impl/pipeline/__init__.py`
+- `jittor_impl/pipeline/scheduler_jt.py`
+- `jittor_impl/pipeline/scaler_jt.py`
+
+修改文件：
+
+- `scripts/train_jittor_rn50_zoomnext.py`
+
+### 19.1 `jittor_impl/pipeline/__init__.py`
+
+完整代码：
+
+```python
+"""Training utilities for the Jittor ZoomNeXt migration."""
+
+from .scaler_jt import ScalerJT
+from .scheduler_jt import SchedulerJT
+
+__all__ = ["ScalerJT", "SchedulerJT"]
+```
+
+解释：
+
+这个文件的作用是把 Jittor 版训练框架工具显式导出，方便训练脚本直接通过：
+
+```python
+from jittor_impl.pipeline import ScalerJT, SchedulerJT
+```
+
+导入。
+
+### 19.2 `jittor_impl/pipeline/scheduler_jt.py`
+
+完整代码：
+
+```python
+"""Jittor counterpart of the training scheduler used by the PyTorch pipeline."""
+
+from __future__ import annotations
+
+import copy
+import math
+import os
+import warnings
+from bisect import bisect_right
+
+import numpy as np
+
+
+def linear_increase(low_bound, up_bound, percentage):
+    assert 0 <= percentage <= 1, f"percentage({percentage}) must be in [0, 1]"
+    return low_bound + (up_bound - low_bound) * percentage
+
+
+def cos_anneal(low_bound, up_bound, percentage):
+    assert 0 <= percentage <= 1, f"percentage({percentage}) must be in [0, 1]"
+    cos_percentage = (1 + math.cos(math.pi * percentage)) / 2.0
+    return linear_increase(low_bound, up_bound, percentage=cos_percentage)
+
+
+def poly_anneal(low_bound, up_bound, percentage, lr_decay):
+    assert 0 <= percentage <= 1, f"percentage({percentage}) must be in [0, 1]"
+    poly_percentage = pow((1 - percentage), lr_decay)
+    return linear_increase(low_bound, up_bound, percentage=poly_percentage)
+
+
+def linear_anneal(low_bound, up_bound, percentage):
+    assert 0 <= percentage <= 1, f"percentage({percentage}) must be in [0, 1]"
+    return linear_increase(low_bound, up_bound, percentage=1 - percentage)
+
+
+def get_f3_coef_func(num_iters):
+    def get_f3_coef(curr_idx):
+        assert 0 <= curr_idx <= num_iters
+        return 1 - abs((curr_idx + 1) / (num_iters + 1) * 2 - 1)
+
+    return get_f3_coef
+
+
+def get_step_coef_func(gamma, milestones):
+    if isinstance(milestones, (tuple, list)):
+        milestones = list(sorted(milestones))
+        return lambda curr_idx: gamma ** bisect_right(milestones, curr_idx)
+    if isinstance(milestones, int):
+        return lambda curr_idx: gamma ** ((curr_idx + 1) // milestones)
+    raise ValueError(f"milestones only can be list/tuple/int, but now it is {type(milestones)}")
+
+
+def get_cos_coef_func(half_cycle, min_coef, max_coef=1):
+    def get_cos_coef(curr_idx):
+        recomputed_idx = curr_idx % (half_cycle + 1)
+        return cos_anneal(low_bound=min_coef, up_bound=max_coef, percentage=recomputed_idx / half_cycle)
+
+    return get_cos_coef
+
+
+def get_fatcos_coef_func(start_iter, half_cycle, min_coef, max_coef=1):
+    def get_cos_coef(curr_idx):
+        curr_idx = max(0, curr_idx - start_iter)
+        recomputed_idx = curr_idx % (half_cycle + 1)
+        return cos_anneal(low_bound=min_coef, up_bound=max_coef, percentage=recomputed_idx / half_cycle)
+
+    return get_cos_coef
+
+
+def get_poly_coef_func(num_iters, lr_decay, min_coef, max_coef=1):
+    def get_poly_coef(curr_idx):
+        assert 0 <= curr_idx <= num_iters, (curr_idx, num_iters)
+        return poly_anneal(low_bound=min_coef, up_bound=max_coef, percentage=curr_idx / num_iters, lr_decay=lr_decay)
+
+    return get_poly_coef
+
+
+def get_scheduler_coef_func(mode, num_iters, cfg):
+    assert num_iters > 0
+    min_coef = cfg.get("min_coef", 1e-6)
+    if min_coef is None or min_coef == 0:
+        warnings.warn(f"The min_coef ({min_coef}) of the scheduler will be replaced with 1e-6")
+        min_coef = 1e-6
+
+    if mode == "step":
+        coef_func = get_step_coef_func(gamma=cfg["gamma"], milestones=cfg["milestones"])
+    elif mode == "cos":
+        if half_cycle := cfg.get("half_cycle"):
+            half_cycle -= 1
+        else:
+            half_cycle = num_iters
+        if (num_iters - half_cycle) % (half_cycle + 1) != 0:
+            percentage = ((num_iters - half_cycle) % (half_cycle + 1)) / (half_cycle + 1) * 100
+            warnings.warn(
+                f"The final annealing process ({percentage:.3f}%) is not complete. "
+                "Please pay attention to the generated 'lr_coef.png'."
+            )
+        coef_func = get_cos_coef_func(half_cycle=half_cycle, min_coef=min_coef)
+    elif mode == "fatcos":
+        assert 0 <= cfg["start_percent"] < 1, cfg["start_percent"]
+        start_iter = int(cfg["start_percent"] * num_iters)
+        num_iters -= start_iter
+        if half_cycle := cfg.get("half_cycle"):
+            half_cycle -= 1
+        else:
+            half_cycle = num_iters
+        if (num_iters - half_cycle) % (half_cycle + 1) != 0:
+            percentage = ((num_iters - half_cycle) % (half_cycle + 1)) / (half_cycle + 1) * 100
+            warnings.warn(
+                f"The final annealing process ({percentage:.3f}%) is not complete. "
+                "Please pay attention to the generated 'lr_coef.png'."
+            )
+        coef_func = get_fatcos_coef_func(start_iter=start_iter, half_cycle=half_cycle, min_coef=min_coef)
+    elif mode == "poly":
+        coef_func = get_poly_coef_func(num_iters=num_iters, lr_decay=cfg["lr_decay"], min_coef=min_coef)
+    elif mode == "constant":
+        coef_func = lambda x: cfg.get("coef", 1)
+    elif mode == "f3":
+        coef_func = get_f3_coef_func(num_iters=num_iters)
+    else:
+        raise NotImplementedError(f"{mode} must be in {SchedulerJT.supported_scheduler_modes}")
+    return coef_func
+
+
+def get_warmup_coef_func(num_iters, min_coef, max_coef=1, mode="linear"):
+    assert num_iters > 0
+    if mode == "cos":
+        anneal_func = cos_anneal
+    elif mode == "linear":
+        anneal_func = linear_anneal
+    else:
+        raise NotImplementedError(f"{mode} must be in {SchedulerJT.supported_warmup_modes}")
+
+    def get_warmup_coef(curr_idx):
+        return anneal_func(low_bound=min_coef, up_bound=max_coef, percentage=1 - curr_idx / num_iters)
+
+    return get_warmup_coef
+
+
+class SchedulerJT:
+    supported_scheduler_modes = ("step", "cos", "fatcos", "poly", "constant", "f3")
+    supported_warmup_modes = ("cos", "linear")
+
+    def __init__(self, optimizer, num_iters, epoch_length, scheduler_cfg, step_by_batch=True):
+        self.optimizer = optimizer
+        self.num_iters = num_iters
+        self.epoch_length = epoch_length
+        self.step_by_batch = step_by_batch
+
+        self.scheduler_cfg = copy.deepcopy(scheduler_cfg)
+        self.mode = scheduler_cfg["mode"]
+        if self.mode not in self.supported_scheduler_modes:
+            raise NotImplementedError(
+                f"{self.mode} is not implemented. Has been supported: {self.supported_scheduler_modes}"
+            )
+
+        warmup_cfg = scheduler_cfg.get("warmup", None)
+        num_warmup_iters = 0
+        if warmup_cfg is not None and isinstance(warmup_cfg, dict):
+            num_warmup_iters = warmup_cfg["num_iters"]
+            if num_warmup_iters > 0:
+                self.warmup_coef_func = get_warmup_coef_func(
+                    num_warmup_iters,
+                    min_coef=warmup_cfg.get("initial_coef", 0.01),
+                    mode=warmup_cfg.get("mode", "linear"),
+                )
+        self.num_warmup_iters = num_warmup_iters
+
+        if step_by_batch:
+            num_scheduler_iters = num_iters - num_warmup_iters
+        else:
+            num_scheduler_iters = (num_iters - num_warmup_iters) // epoch_length
+
+        self.lr_coef_func = get_scheduler_coef_func(
+            mode=self.mode,
+            num_iters=max(1, num_scheduler_iters) - 1,
+            cfg=scheduler_cfg["cfg"],
+        )
+        self.num_scheduler_iters = num_scheduler_iters
+        self.last_lr_coef = 0
+        self.initial_lrs = None
+
+    def __repr__(self):
+        formatted_string = [
+            f"{self.__class__.__name__}: (\n",
+            f"num_iters: {self.num_iters}\n",
+            f"epoch_length: {self.epoch_length}\n",
+            f"warmup_iter: [0, {self.num_warmup_iters})\n",
+            f"scheduler_iter: [{self.num_warmup_iters}, {self.num_iters - 1}]\n",
+            f"mode: {self.mode}\n",
+            f"scheduler_cfg: {self.scheduler_cfg}\n",
+            f"initial_lrs: {self.initial_lrs}\n",
+            f"step_by_batch: {self.step_by_batch}\n)",
+        ]
+        return "    ".join(formatted_string)
+
+    def record_lrs(self, param_groups):
+        self.initial_lrs = [group["lr"] for group in param_groups]
+
+    def update(self, coef: float):
+        assert self.initial_lrs is not None, "Please run .record_lrs(optimizer) first."
+        for curr_group, initial_lr in zip(self.optimizer.param_groups, self.initial_lrs):
+            curr_group["lr"] = coef * initial_lr
+
+    def step(self, curr_idx):
+        if curr_idx < self.num_warmup_iters:
+            self.update(coef=self.get_lr_coef(curr_idx))
+        else:
+            if self.step_by_batch:
+                self.update(coef=self.get_lr_coef(curr_idx))
+            elif curr_idx % self.epoch_length == 0:
+                self.update(coef=self.get_lr_coef(curr_idx))
+
+    def get_lr_coef(self, curr_idx):
+        coef = None
+        if curr_idx < self.num_warmup_iters:
+            coef = self.warmup_coef_func(curr_idx)
+        else:
+            if self.step_by_batch:
+                coef = self.lr_coef_func(curr_idx - self.num_warmup_iters)
+            elif curr_idx % self.epoch_length == 0 or curr_idx == self.num_warmup_iters:
+                coef = self.lr_coef_func((curr_idx - self.num_warmup_iters) // self.epoch_length)
+        if coef is not None:
+            self.last_lr_coef = coef
+        return self.last_lr_coef
+
+    def plot_lr_coef_curve(self, save_path=""):
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            from matplotlib import pyplot as plt
+        except ImportError:
+            warnings.warn("matplotlib is not installed, skip plotting lr coefficient curve.")
+            return
+
+        try:
+            from adjustText import adjust_text
+        except ImportError:
+            adjust_text = None
+
+        plt.rc("xtick", labelsize="small")
+        plt.rc("ytick", labelsize="small")
+
+        fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 4), dpi=600)
+        ax.set_title("Learning Rate Coefficient Curve")
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Coefficient")
+
+        x_data = np.arange(self.num_iters)
+        y_data = np.array([self.get_lr_coef(x) for x in x_data])
+
+        x_min, x_max = 0, self.num_iters - 1
+        dx = self.num_iters * 0.1
+        ax.set_xlim(x_min - dx, x_max + 2 * dx)
+
+        y_min, y_max = y_data.min(), y_data.max()
+        dy = (y_max - y_min) * 0.1 if y_max != y_min else 0.1
+        ax.set_ylim((y_min - dy, y_max + dy))
+
+        if self.step_by_batch:
+            marker_on = [0, -1]
+            key_point_xs = [0, self.num_iters - 1]
+            for idx in range(1, len(y_data) - 1):
+                prev_y = y_data[idx - 1]
+                curr_y = y_data[idx]
+                next_y = y_data[idx + 1]
+                if (
+                    (curr_y > prev_y and curr_y >= next_y)
+                    or (curr_y >= prev_y and curr_y > next_y)
+                    or (curr_y <= prev_y and curr_y < next_y)
+                    or (curr_y < prev_y and curr_y <= next_y)
+                ):
+                    marker_on.append(idx)
+                    key_point_xs.append(idx)
+
+            marker_on = sorted(set(marker_on))
+            key_point_xs = sorted(set(key_point_xs))
+            if adjust_text is not None:
+                texts = []
+                for x in key_point_xs:
+                    y = y_data[x]
+                    texts.append(ax.text(x=x, y=y, s=f"({x:d},{y:.3e})"))
+                adjust_text(texts, arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=-0.3"))
+
+            ax.set_xticks(key_point_xs)
+            ax.plot(x_data, y_data, marker="o", markevery=marker_on)
+        else:
+            ax.plot(x_data, y_data)
+
+        ax.spines["right"].set_visible(False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["left"].set_visible(True)
+        ax.spines["bottom"].set_visible(True)
+
+        plt.tight_layout()
+        if save_path:
+            fig.savefig(os.path.join(save_path, "lr_coef.png"))
+        plt.close()
+```
+
+解释：
+
+这份代码基本上把 PyTorch 主干里的 scheduler 逻辑按纯 Python 方式迁了过来，因此它不依赖 PyTorch 本身。
+
+补齐后的 `SchedulerJT` 支持：
+
+- warmup
+- `step / cos / fatcos / poly / constant / f3`
+- `sche_usebatch=True/False`
+- 多参数组学习率同步更新
+- 学习率系数曲线绘图
+
+这里有一个工程化调整：
+
+- `plot_lr_coef_curve()` 里的 `matplotlib` 和 `adjustText` 改成了延迟导入
+
+这样即使某些环境里没有装绘图库，训练本身也不会因为导入失败而直接崩掉，只会跳过绘图。
+
+### 19.3 `jittor_impl/pipeline/scaler_jt.py`
+
+完整代码：
+
+```python
+"""Jittor counterpart of the PyTorch scaler wrapper used in training."""
+
+from __future__ import annotations
+
+from contextlib import nullcontext
+
+
+class _JittorAutocast:
+    def __init__(self, jt, enabled: bool = False, amp_level: int = 5):
+        self.jt = jt
+        self.enabled = enabled
+        self.amp_level = amp_level
+        self.scope = None
+
+    def __enter__(self):
+        if not self.enabled:
+            self.scope = nullcontext()
+        else:
+            self.scope = self.jt.flag_scope(
+                auto_mixed_precision_level=self.amp_level,
+                amp_level=self.amp_level,
+            )
+        return self.scope.__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self.scope.__exit__(exc_type, exc_value, traceback)
+
+
+def _clip_grad_value_jt(jt, optimizer, clip_value: float):
+    for param_group in optimizer.param_groups:
+        grads = param_group.get("grads", [])
+        for grad in grads:
+            clipped = jt.minimum(jt.maximum(grad, -clip_value), clip_value)
+            grad.assign(clipped.stop_grad())
+
+
+class ScalerJT:
+    def __init__(
+        self,
+        jt,
+        optimizer,
+        use_fp16: bool = False,
+        *,
+        set_to_none: bool = False,
+        clip_grad: bool = False,
+        clip_mode=None,
+        clip_cfg=None,
+        amp_level: int = 5,
+    ) -> None:
+        self.jt = jt
+        self.optimizer = optimizer
+        self.use_fp16 = use_fp16
+        self.set_to_none = set_to_none
+        self.clip_grad = clip_grad
+        self.clip_mode = clip_mode
+        self.clip_cfg = clip_cfg or {}
+        self.amp_level = amp_level
+
+    def autocast(self):
+        return _JittorAutocast(self.jt, enabled=self.use_fp16, amp_level=self.amp_level)
+
+    def _apply_grad_clip(self):
+        if not self.clip_grad:
+            return
+        if self.clip_mode == "norm":
+            if "max_norm" not in self.clip_cfg:
+                raise ValueError("`clip_cfg` must contain `max_norm`.")
+            self.optimizer.clip_grad_norm(self.clip_cfg.get("max_norm"), self.clip_cfg.get("norm_type", 2.0))
+        elif self.clip_mode == "value":
+            if "clip_value" not in self.clip_cfg:
+                raise ValueError("`clip_cfg` must contain `clip_value`.")
+            _clip_grad_value_jt(self.jt, self.optimizer, clip_value=self.clip_cfg.get("clip_value"))
+        else:
+            raise NotImplementedError(self.clip_mode)
+
+    def calculate_grad(self, loss):
+        self.optimizer.backward(loss)
+        self._apply_grad_clip()
+
+    def update_grad(self):
+        self.optimizer.step()
+        # Jittor does not expose a set_to_none equivalent; keep the interface for parity.
+        self.optimizer.zero_grad()
+
+    def state_dict(self):
+        return {
+            "use_fp16": self.use_fp16,
+            "set_to_none": self.set_to_none,
+            "clip_grad": self.clip_grad,
+            "clip_mode": self.clip_mode,
+            "clip_cfg": self.clip_cfg,
+            "amp_level": self.amp_level,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.use_fp16 = state_dict.get("use_fp16", self.use_fp16)
+        self.set_to_none = state_dict.get("set_to_none", self.set_to_none)
+        self.clip_grad = state_dict.get("clip_grad", self.clip_grad)
+        self.clip_mode = state_dict.get("clip_mode", self.clip_mode)
+        self.clip_cfg = state_dict.get("clip_cfg", self.clip_cfg)
+        self.amp_level = state_dict.get("amp_level", self.amp_level)
+```
+
+解释：
+
+这里的目标不是机械照搬 PyTorch 的 `GradScaler` 类名，而是把“训练脚本如何组织前向、反向、梯度裁剪、更新”这一层接口迁过来。
+
+补齐后的 `ScalerJT` 提供了和主干一致的几类能力：
+
+- `autocast()` 风格的上下文管理
+- `calculate_grad(loss)` 统一负责 backward
+- `update_grad()` 统一负责 step + zero_grad
+- 可选梯度裁剪
+- `state_dict/load_state_dict` 风格接口
+
+这里有一个需要特别说明的实现差异：
+
+- PyTorch 主干使用的是 `torch.cuda.amp.GradScaler`
+- Jittor 这里使用的是官方文档提供的 `flag_scope(amp_level / auto_mixed_precision_level)` 方式来开启混精
+
+也就是说，Jittor 版是“接口层等价”，底层并不是强行调用 PyTorch，而是用 Jittor 官方 AMP 入口接上去。
+
+### 19.4 `scripts/train_jittor_rn50_zoomnext.py` 关键修改
+
+本轮训练脚本的关键新增代码如下。
+
+```python
+from jittor_impl.models import RN50_ZoomNeXt_JT
+from jittor_impl.models.zoomnext_jt import frozen_bn_stats_jt
+from jittor_impl.pipeline import ScalerJT, SchedulerJT
+from utils import io, ops, py_utils
+```
+
+```python
+    run_meta = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "config": str(Path(args.config).resolve()),
+        "data_cfg": str(Path(args.data_cfg).resolve()),
+        "output_dir": str(Path(args.output_dir).resolve()),
+        "train_datasets": list(cfg.train.data.names),
+        "effective_batch_size": int(cfg.train.batch_size),
+        "effective_num_epochs": int(cfg.train.num_epochs),
+        "effective_lr": float(cfg.train.lr),
+        "effective_grad_acc_step": int(cfg.train.grad_acc_step),
+        "effective_use_amp": bool(cfg.train.use_amp),
+        "effective_sche_usebatch": bool(cfg.train.sche_usebatch),
+        "effective_scheduler": cfg.train.scheduler,
+        "pretrained": args.pretrained,
+        "encoder_weight_path": args.encoder_weight_path,
+        "resume_from": args.resume_from,
+        "max_iters": args.max_iters,
+        "save_every": args.save_every,
+        "seed": args.seed,
+        "use_cuda": args.use_cuda,
+    }
+```
+
+```python
+def construct_scheduler_jt(optimizer, total_iters: int, epoch_length: int, train_cfg):
+    scheduler = SchedulerJT(
+        optimizer=optimizer,
+        num_iters=total_iters,
+        epoch_length=epoch_length,
+        scheduler_cfg=train_cfg.scheduler,
+        step_by_batch=train_cfg.sche_usebatch,
+    )
+    scheduler.record_lrs(param_groups=optimizer.param_groups)
+    return scheduler
+
+
+def construct_scaler_jt(jt, optimizer, train_cfg):
+    optimizer_cfg = train_cfg.optimizer
+    return ScalerJT(
+        jt=jt,
+        optimizer=optimizer,
+        use_fp16=bool(train_cfg.use_amp),
+        set_to_none=bool(optimizer_cfg.get("set_to_none", False)),
+        clip_grad=bool(optimizer_cfg.get("clip_grad", False)),
+        clip_mode=optimizer_cfg.get("clip_mode"),
+        clip_cfg=optimizer_cfg.get("clip_cfg"),
+        amp_level=int(train_cfg.get("amp_level", 5)),
+    )
+```
+
+```python
+    batch_size = int(cfg.train.batch_size)
+    num_epochs = int(cfg.train.num_epochs)
+    epoch_length = max(1, len(dataset) // batch_size)
+    total_iters = args.max_iters or (num_epochs * epoch_length)
+    if args.max_iters is not None:
+        num_epochs = max(num_epochs, (total_iters + epoch_length - 1) // epoch_length)
+    scheduler = construct_scheduler_jt(optimizer=optimizer, total_iters=total_iters, epoch_length=epoch_length, train_cfg=cfg.train)
+    scheduler.plot_lr_coef_curve(save_path=str(run_paths["run_dir"]))
+    scaler = construct_scaler_jt(jt=jt, optimizer=optimizer, train_cfg=cfg.train)
+    grad_acc_step = max(1, int(cfg.train.grad_acc_step))
+    curr_iter = 0
+
+    start_time = time.perf_counter()
+    progress = tqdm(total=total_iters, desc="[JT-TRAIN]", ncols=100, mininterval=0.0, file=sys.stdout)
+    append_text_log(run_paths["log"], str(scheduler))
+    optimizer.zero_grad()
+```
+
+```python
+            iter_percentage = curr_iter / max(total_iters - 1, 1)
+            scheduler.step(curr_iter)
+            emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="forward")
+            with scaler.autocast():
+                outputs = model(data=jt_batch, iter_percentage=iter_percentage)
+            loss = outputs["loss"]
+            loss = loss / grad_acc_step
+            emit_progress(progress, epoch=epoch, curr_iter=curr_iter, stage="backward")
+            scaler.calculate_grad(loss)
+            if (curr_iter + 1) % grad_acc_step == 0 or curr_iter == total_iters - 1:
+                scaler.update_grad()
+```
+
+解释：
+
+训练脚本这一轮一共补了四件事。
+
+第一件事，是把 scheduler 正式接进训练主循环。  
+现在每个 iter 前都会先执行：
+
+```python
+scheduler.step(curr_iter)
+```
+
+这意味着配置文件里的：
+
+- `cfg.train.scheduler`
+- `cfg.train.sche_usebatch`
+- `cfg.train.scheduler.warmup`
+
+终于开始真正影响训练过程，而不再只是摆在 config 里没有生效。
+
+第二件事，是把 `use_amp` 接进了前向过程。  
+现在模型前向被包在：
+
+```python
+with scaler.autocast():
+    outputs = model(...)
+```
+
+之下，这样当 `cfg.train.use_amp=True` 时，就会通过 Jittor AMP 入口开启混精运行。
+
+第三件事，是把 `grad_acc_step` 接进了训练过程。  
+现在 loss 会先除以 `grad_acc_step`，然后按累计步数控制是否执行真正的 optimizer 更新。这一点和主干训练逻辑是一致的。
+
+第四件事，是把训练元信息记录补全。  
+这一轮把下面这些最终生效值写进了 `run_meta.json`：
+
+- `effective_grad_acc_step`
+- `effective_use_amp`
+- `effective_sche_usebatch`
+- `effective_scheduler`
+
+这样后续回看某次实验目录时，就能知道这次训练到底是不是开了 AMP、是不是按 batch 调 lr、scheduler 配置是什么。
+
+### 19.5 这一轮改动意味着什么
+
+到这一步，Jittor 训练入口已经不再只是“能跑前向和反向”的最小脚本，而是开始真正接近主干的训练框架能力了。
+
+补齐后，训练主链已经具备：
+
+- 参数分组优化器
+- warmup + scheduler
+- 学习率曲线绘图
+- AMP 风格前向上下文
+- 梯度裁剪接口
+- gradient accumulation
+- checkpoint 保存
+- 日志与运行元信息记录
+
+目前和主干相比，最大的剩余差异已经不再是“完全没有 scheduler/scaler”，而更多是后续可以继续打磨的工程细节，例如：
+
+- 是否要增加 optimizer/scaler 状态一并保存
+- 是否要做更完整的 resume 训练状态恢复
+- 是否要补 TensorBoard 类似能力
+
+但从训练框架主线来看，这一轮已经把此前明确缺失的两块核心能力补上了。
